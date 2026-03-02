@@ -1,21 +1,17 @@
 {
   "name": "orqestra",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Sahil-796/orqestra.git"
+  "peerDependencies": {
+    "typescript": "^5.9.3"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/Sahil-796/orqestra/issues"
-  },
-  "homepage": "https://github.com/Sahil-796/orqestra#readme"
+  "dependencies": {
+    "@types/node": "^25.3.3",
+    "@types/uuid": "^11.0.0",
+    "ioredis": "^5.10.0",
+    "uuid": "^13.0.0"
+  }
 }
