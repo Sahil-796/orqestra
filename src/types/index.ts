@@ -3,33 +3,33 @@ export interface OrqestraOptions {
   prefix?: string
 }
 
-// export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
+export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
 
-// export type WorkflowStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
+export type WorkflowStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
+export interface WorkflowState {
+  id: string
+  name: string
+  status: WorkflowStatus
+  payload: unknown
+  steps: StepState[]
+  createdAt: number
+  updatedAt: number
+}
 
-// export interface StepResult<T = unknown> {
-//   data?: T
-//   error?: string
-// }
+export interface StepResult<T = unknown> {
+  data?: T
+  error?: string
+}
 
-// export interface StepState {
-//   name: string
-//   status: StepStatus
-//   attempts: number
-//   startedAt?: number
-//   finishedAt?: number
-//   result?: StepResult
-// }
+export interface StepState {
+  name: string
+  status: StepStatus
+  attempts: number
+  startedAt?: number
+  finishedAt?: number
+  result?: StepResult
+}
 
-// export interface WorkflowState {
-//   id: string
-//   name: string
-//   status: WorkflowStatus
-//   payload: unknown
-//   steps: StepState[]
-//   createdAt: number
-//   updatedAt: number
-// }
 
 // export interface StepContext {
 //   workflowId: string
