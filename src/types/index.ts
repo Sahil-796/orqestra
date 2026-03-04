@@ -1,17 +1,14 @@
-import Redis from 'ioredis'
-
 export interface OrqestraOptions {
-  redis: Redis | string
+  redisUrl: string
   prefix?: string
-  maxAttempts?: number
-  visibilityTimeout?: number
 }
 
 // export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
+
 // export type WorkflowStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
 
-// export interface StepResult {
-//   data?: any
+// export interface StepResult<T = unknown> {
+//   data?: T
 //   error?: string
 // }
 
@@ -26,22 +23,18 @@ export interface OrqestraOptions {
 
 // export interface WorkflowState {
 //   id: string
-//   type: string
+//   name: string
 //   status: WorkflowStatus
-//   currentStep: string
-//   payload: any
+//   payload: unknown
 //   steps: StepState[]
 //   createdAt: number
 //   updatedAt: number
 // }
 
-
-// export type StepHandler = (ctx: StepContext) => Promise<any>
-
 // export interface StepContext {
 //   workflowId: string
-//   stepName: string
-//   idempotencyKey: string
-//   attempt: number
-//   payload: any
+//   payload: unknown
+//   step: <T>(name: string, fn: () => Promise<T>) => Promise<T>
 // }
+
+// export type WorkflowHandler = (ctx: StepContext) => Promise<void>
