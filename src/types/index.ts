@@ -1,4 +1,4 @@
-export interface OrqestraOptions {
+export type OrqestraOptions = {
   redisUrl: string
   prefix?: string
 }
@@ -6,7 +6,7 @@ export interface OrqestraOptions {
 export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
 
 export type WorkflowStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dlq'
-export interface WorkflowState {
+export type WorkflowState = {
   id: string
   name: string
   status: WorkflowStatus
@@ -16,12 +16,12 @@ export interface WorkflowState {
   updatedAt: number
 }
 
-export interface StepResult<T = unknown> {
+export type StepResult<T = unknown> = {
   data?: T
   error?: string
 }
 
-export interface StepState {
+export type StepState = {
   name: string
   status: StepStatus
   attempts: number
