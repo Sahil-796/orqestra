@@ -31,10 +31,10 @@ export type StepState = {
 }
 
 
-// export interface StepContext {
-//   workflowId: string
-//   payload: unknown
-//   step: <T>(name: string, fn: () => Promise<T>) => Promise<T>
-// }
+export type StepContext = {
+  workflowId: string
+  payload: unknown //  ctx passed to the whole workflow
+  step: <T>(name: string, fn: () => Promise<T>) => Promise<T> // step is a func which receves name, fn and returns T
+}
 
-// export type WorkflowHandler = (ctx: StepContext) => Promise<void>
+export type WorkflowHandler = (ctx: StepContext) => Promise<void>
