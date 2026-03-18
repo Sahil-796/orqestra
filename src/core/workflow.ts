@@ -1,10 +1,21 @@
-type StepFn<T = unknown> = (prev: unknown, ctx: Record<string, unknown>) => Promise<T>
+import type Redis from 'ioredis'
+
+type StepFn<T = unknown> = (
+  prev: unknown,
+  ctx: Record<string, unknown>
+) => Promise<T>
 
 export class WorkflowBuilder {
   private steps = new Map<number, StepFn>()
+  private redis: Redis
 
-  step<T>(id: number, fn: (prev: unknown, ctx: Record<string, unknown>) => Promise<T>): this {
-    this.steps.set(id, fn as StepFn)
+  constructor(redis: Redis) {
+    this.redis = redis
+  }
+
+  step<T>(id: number, fn: StepFn<T>): this {
+    this.steps.set(id, fn)
+
     return this
   }
 
@@ -15,7 +26,8 @@ export class WorkflowBuilder {
     let prev: unknown = undefined
     
     for (const id of sortedIds) {
-      const step = this.steps.get(id)!
+      const step = this.steps.get(id)
+      if (!step) continue
       prev = await step(prev, ctx)
     }
     
