@@ -17,7 +17,7 @@ bunx tsc --noEmit      # typecheck (strict mode) — treat zero errors as the ba
 bun run db:down        # stop Postgres
 ```
 
-Default DB: `postgres://orqestra:orqestra@localhost:5433/orqestra` (override via `DATABASE_URL`). Other env: `ORQ_POOL_SIZE`, `ORQ_LOG_LEVEL`. All parsed in `src/config.ts`, which fails fast on bad input.
+Default DB: `postgres://orqestra:orqestra@localhost:5433/orqestra` (override via `DATABASE_URL`). Other env: `ORQ_POOL_SIZE`, `ORQ_LOG_LEVEL`, and the worker defaults `ORQ_LEASE_TTL_MS`, `ORQ_POLL_INTERVAL_MS`, `ORQ_WORKER_CONCURRENCY`. All parsed in `src/config.ts`, which fails fast on bad input.
 
 ## Architecture — the load-bearing ideas
 
