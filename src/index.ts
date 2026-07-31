@@ -11,8 +11,11 @@ export type { WorkflowBuilder, WorkflowHandle, StepFn, StepOptions } from './def
 export type { WorkflowContext } from './define/context.ts'
 export { createWorkflowContext } from './define/context.ts'
 
-export { startRun, executeRun, resumeRun, resumeAll } from './engine/executor.ts'
-export type { StartRunOptions, RunResult } from './engine/executor.ts'
+export { startRun, executeRun, resumeRun, resumeAll, enqueueRun, advanceRun } from './engine/executor.ts'
+export type { StartRunOptions, RunResult, EnqueueRunResult, AdvanceResult } from './engine/executor.ts'
+
+export { createWorker } from './worker/worker.ts'
+export type { Worker, WorkerOptions } from './worker/worker.ts'
 
 export type { OrqConfig, LogLevel } from './config.ts'
 export { loadConfig } from './config.ts'

@@ -17,6 +17,7 @@ import {
   getWorkflowByName,
   insertHistory,
   insertSteps,
+  lockRun,
   markStepReady,
   markStepRunning,
   resetRunningSteps,
@@ -29,6 +30,7 @@ import { decodeResult, serializeError, type RunStatus } from '../types.ts'
 import { createWorkflowContext } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { createLogger } from '../observability/logger.ts'
+import { isRunComplete, newlyReadySteps } from './scheduler.ts'
 
 const logger = createLogger()
 
@@ -49,17 +51,22 @@ function isTerminal(status: RunStatus): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled'
 }
 
-/**
- * Start a workflow run. Idempotent when `options.idempotencyKey` is given:
- * a second `startRun` with the same key never re-materializes steps — if
- * the existing run already finished, its result is returned as-is; if it's
- * still in flight, execution resumes instead of starting over (feature #8).
- */
-export async function startRun(
+export interface EnqueueRunResult {
+  runId: string
+  created: boolean
+}
+
+// Shared by startRun (inline) and enqueueRun (durable): register the
+// workflow, idempotently create the run row, and — only on first creation —
+// materialize one step row per DAG step (no deps -> ready immediately,
+// otherwise pending until the readiness sweep in `advanceRun` flips it).
+// Never runs anything; that's the caller's job (executeRun, or a worker
+// claiming rows off the queue).
+async function registerAndCreateRun(
   db: Db,
   handle: WorkflowHandle,
-  options: StartRunOptions = {}
-): Promise<RunResult> {
+  options: StartRunOptions
+): Promise<{ run: RunRow; created: boolean }> {
   const workflow = await handle.register(db)
 
   const { run, created } = await createRun(db, {
@@ -70,15 +77,8 @@ export async function startRun(
     idempotencyKey: options.idempotencyKey,
   })
 
-  if (!created) {
-    if (isTerminal(run.status)) {
-      return { runId: run.id, status: run.status, output: run.output }
-    }
-    return executeRun(db, handle, run.id)
-  }
+  if (!created) return { run, created }
 
-  // One step row per DAG step: no deps -> ready immediately, otherwise
-  // pending until executeRun's loop flips it once its deps complete.
   const steps: NewStep[] = handle.definition.steps.map((step) => ({
     name: step.name,
     dependsOn: step.dependsOn,
@@ -93,7 +93,42 @@ export async function startRun(
     await insertHistory(tx, { runId: run.id, type: 'run.created', data: { input: options.input } })
   })
 
+  return { run, created }
+}
+
+/**
+ * Start a workflow run. Idempotent when `options.idempotencyKey` is given:
+ * a second `startRun` with the same key never re-materializes steps — if
+ * the existing run already finished, its result is returned as-is; if it's
+ * still in flight, execution resumes instead of starting over (feature #8).
+ *
+ * INLINE mode: this drives the run to completion (or first failure) on the
+ * calling process before returning. See `enqueueRun` for the DURABLE mode
+ * that hands the run to the queue instead.
+ */
+export async function startRun(
+  db: Db,
+  handle: WorkflowHandle,
+  options: StartRunOptions = {}
+): Promise<RunResult> {
+  const { run } = await registerAndCreateRun(db, handle, options)
   return executeRun(db, handle, run.id)
+}
+
+/**
+ * Register the workflow, idempotently create the run (same semantics as
+ * `startRun`), and return IMMEDIATELY without executing anything — the step
+ * rows just inserted (or already present) are the queue from here on; any
+ * worker draining this namespace picks them up. This is the DURABLE
+ * counterpart to `startRun`'s INLINE mode.
+ */
+export async function enqueueRun(
+  db: Db,
+  handle: WorkflowHandle,
+  options: StartRunOptions = {}
+): Promise<EnqueueRunResult> {
+  const { run, created } = await registerAndCreateRun(db, handle, options)
+  return { runId: run.id, created }
 }
 
 /**
@@ -122,21 +157,8 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
   }
 
   while (true) {
-    const steps = await getStepsByRun(db, runId)
-
-    // Flip any pending step whose deps are all completed to ready.
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i]!
-      if (step.status !== 'pending') continue
-      const depsCompleted = step.depends_on.every(
-        (depName) => steps.find((s) => s.name === depName)?.status === 'completed'
-      )
-      if (depsCompleted) steps[i] = await markStepReady(db, step.id)
-    }
-
-    if (steps.every((s) => s.status === 'completed')) {
-      return finalize(db, runId, steps)
-    }
+    const { steps, result } = await advanceRun(db, runId)
+    if (result) return result // every step completed — advanceRun already finalized the run
 
     const readySteps = steps.filter((s) => s.status === 'ready')
     if (readySteps.length === 0) {
@@ -203,20 +225,64 @@ async function runStep(
   }
 }
 
-/** All steps completed: persist the run's output and mark it completed. */
-async function finalize(db: Db, runId: string, steps: StepRow[]): Promise<RunResult> {
+export interface AdvanceResult {
+  /** The run's steps, reflecting any pending -> ready flips this call made. */
+  steps: StepRow[]
+  /** Set once the run just finished — the caller should stop driving it. */
+  result: RunResult | undefined
+}
+
+/**
+ * The one piece of "what happens after a step's outcome lands" logic,
+ * shared by the inline executor's loop and the worker (src/worker/worker.ts)
+ * so there is exactly one implementation of DAG advancement, not two that
+ * could drift. Given `sql`, which may be a bare `db` (executeRun's loop,
+ * matching Phase 1's original never-wrapped-in-a-tx ready-flip behavior) or
+ * an open transaction (a worker committing a step's outcome and advancing
+ * the run atomically in the same tx — see the worker's `commitOutcome`):
+ *
+ *   1. Re-read the run's steps and flip every `pending` step whose deps are
+ *      all `completed` to `ready` (the readiness rule lives once, in
+ *      scheduler.ts's `newlyReadySteps` — not re-implemented here).
+ *   2. If every step is now `completed`, finalize the run: build `output`
+ *      as `{ [stepName]: decodedResultValue }` and mark it `completed`.
+ *
+ * Returns the (possibly updated) steps either way, plus a `result` that's
+ * only set when this call was the one that finished the run.
+ *
+ * Concurrency note: this locks the run row (`lockRun`) before reading the
+ * steps. Without that, two sibling fan-in steps completing in overlapping
+ * worker transactions can each read the *other's* not-yet-committed
+ * completion as still `running` — neither observes both deps satisfied, so
+ * neither flips the downstream step to `ready`, and it's stranded `pending`
+ * forever (no third event ever re-triggers the check). Locking the run row
+ * makes the second transaction to reach this point wait for the first to
+ * commit, so its subsequent read of the steps sees the first's completion
+ * too. Cheap and correct in the common uncontended case; only matters when
+ * two sibling steps finish in the same narrow window.
+ */
+export async function advanceRun(sql: Db, runId: string): Promise<AdvanceResult> {
+  await lockRun(sql, runId)
+  const steps = await getStepsByRun(sql, runId)
+
+  for (const step of newlyReadySteps(steps)) {
+    const updated = await markStepReady(sql, step.id)
+    const i = steps.findIndex((s) => s.id === step.id)
+    if (i !== -1) steps[i] = updated
+  }
+
+  if (!isRunComplete(steps)) return { steps, result: undefined }
+
   const output: Record<string, unknown> = {}
   for (const step of steps) {
     const decoded = decodeResult<unknown>(step.result)
     output[step.name] = decoded.ok ? decoded.value : undefined
   }
 
-  await withTransaction(db, async (tx) => {
-    await updateRunStatus(tx, runId, 'completed', { output, finishedAt: new Date() })
-    await insertHistory(tx, { runId, type: 'run.completed', data: { output } })
-  })
+  await updateRunStatus(sql, runId, 'completed', { output, finishedAt: new Date() })
+  await insertHistory(sql, { runId, type: 'run.completed', data: { output } })
 
-  return { runId, status: 'completed', output }
+  return { steps, result: { runId, status: 'completed', output } }
 }
 
 /** Alias for executeRun — resuming a run IS executing it from where the step rows left off. */
