@@ -32,6 +32,7 @@ export interface RunRow {
   created_at: Date
   started_at: Date | null
   finished_at: Date | null
+  cancel_requested_at: Date | null
 }
 
 export interface StepRow {
@@ -50,6 +51,8 @@ export interface StepRow {
   timeout_ms: number | null
   priority: number
   reclaim_count: number
+  sleep_seq: number
+  sleeping_until: Date | null
   created_at: Date
   updated_at: Date
 }
@@ -547,6 +550,193 @@ export async function countStepsByStatus(
   const counts = {} as Record<StepStatus, number>
   for (const row of rows) counts[row.status] = Number(row.count)
   return counts
+}
+
+// ---- execution control: sleep / cancellation -------------------------------
+//
+// Phase 3. Two mechanisms that both refuse to hold a worker hostage:
+// `ctx.sleep()` gives the worker back for the duration of the sleep instead
+// of blocking it, and cancellation is a *request* another process observes
+// rather than a kill it can't survive. Both are pure storage here — the
+// duration parsing, the wake bookkeeping and the "where is it safe to
+// observe a cancel" policy live above this boundary.
+
+// Suspend a running step for a sleep, fenced on lease ownership exactly like
+// commitOutcome's lockStepIfOwner path: the WHERE clause only matches while
+// this `workerId` still owns a `running` lease, so a worker whose lease was
+// reclaimed underneath it (see reclaimStep) gets undefined back and must
+// write nothing — otherwise a zombie worker could put a step to sleep that
+// its new owner is already executing.
+//
+// The step goes back to `ready` with `run_after = wakeAt`, which is all the
+// scheduling there is: claimNextStep's existing `run_after <= now()` gate
+// makes the row invisible to every worker until the sleep is up, then
+// ordinarily claimable. No timer, no in-memory state, nothing to lose in a
+// crash — the wake time is a durable column, so a sleep survives every
+// worker in the fleet dying and restarting.
+//
+// Two subtleties in the SET list:
+//   - `sleep_seq + 1` records that this sleep has now been served. The step
+//     function re-runs from the top on wake (we cannot freeze a JS stack
+//     across a restart), so without the counter it would suspend on the same
+//     sleep() call forever; the re-executing context skips the first
+//     `sleep_seq` calls.
+//   - `attempt - 1` gives back the attempt that claiming consumed. `attempt`
+//     is incremented at claim time and counted against `max_attempts`, but a
+//     sleep is not a failed attempt — a step with maxAttempts: 1 that sleeps
+//     twice must still be allowed to finish, not die of "out of retries" on
+//     its first wake. `greatest(..., 0)` keeps the column non-negative if it
+//     is ever called on a step claimed by some path that didn't increment.
+export async function sleepStep(
+  sql: Db,
+  args: { stepId: string; workerId: string; wakeAt: Date }
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'ready',
+      run_after = ${args.wakeAt},
+      sleeping_until = ${args.wakeAt},
+      sleep_seq = sleep_seq + 1,
+      attempt = greatest(attempt - 1, 0),
+      lease_owner = null,
+      lease_expires_at = null,
+      updated_at = now()
+    where id = ${args.stepId} and status = 'running' and lease_owner = ${args.workerId}
+    returning *
+  `
+  return rows[0]
+}
+
+// Clear the observability marker once a woken step is actually running
+// again. Unfenced and status-blind on purpose: this column is never read by
+// the claim path, so the worst a stale write can do is make a dashboard
+// briefly wrong, and demanding a lease here would mean a reclaimed step
+// stayed marked "asleep" while its new owner ran it.
+export async function clearSleepMarker(sql: Db, stepId: string): Promise<void> {
+  await sql`
+    update step set sleeping_until = null, updated_at = now()
+    where id = ${stepId} and sleeping_until is not null
+  `
+}
+
+// Record intent to cancel. The WHERE clause is the whole no-op story: a run
+// that already finished has nothing left to cancel, and a second request
+// must not move the timestamp (the first ask is the one worth reporting
+// latency against), so both cases match zero rows and return undefined —
+// callers use that to distinguish "cancellation accepted" from "nothing to
+// do" without a read-then-write race.
+export async function requestRunCancellation(
+  sql: Db,
+  runId: string
+): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    update run set cancel_requested_at = now()
+    where id = ${runId}
+      and status in ('queued', 'running')
+      and cancel_requested_at is null
+    returning *
+  `
+  return rows[0]
+}
+
+// Polled by workers between steps, so it returns a single boolean computed
+// in Postgres rather than dragging the whole run row (input/output jsonb
+// included) across the wire on every tick.
+export async function isCancellationRequested(sql: Db, runId: string): Promise<boolean> {
+  const rows = await sql<{ requested: boolean }[]>`
+    select exists (
+      select 1 from run where id = ${runId} and cancel_requested_at is not null
+    ) as requested
+  `
+  return rows[0]?.requested ?? false
+}
+
+// The terminal half of cancellation, run once no step of this run is still
+// in flight. In one transaction so a reader never sees the run already
+// 'cancelled' while its steps are still claimable:
+//   1. lock the run (`for update`) — the same serialization point advanceRun
+//      uses, so this can't interleave with a concurrent readiness pass that
+//      would flip freshly-cancelled steps back to `ready`;
+//   2. flip pending/ready steps to 'cancelled' so nothing else gets claimed;
+//   3. flip the run itself.
+// `running` steps are deliberately left alone. The worker holding one owns
+// its outcome and will finalize it cooperatively (cancelRunningStep); a
+// write from here would be exactly the unfenced double-write that Phase 2's
+// commit fencing exists to make impossible. Returns run: undefined without
+// touching anything if the run is already terminal.
+export async function finalizeCancelledRun(
+  sql: Db,
+  runId: string
+): Promise<{ run: RunRow | undefined; cancelledSteps: StepRow[] }> {
+  return withTransaction(sql, async (tx) => {
+    const locked = await tx<RunRow[]>`
+      select * from run where id = ${runId} for update
+    `
+    const current = locked[0]
+    if (!current || (current.status !== 'queued' && current.status !== 'running')) {
+      return { run: undefined, cancelledSteps: [] }
+    }
+
+    const cancelledSteps = await tx<StepRow[]>`
+      update step set status = 'cancelled', updated_at = now()
+      where run_id = ${runId} and status in ('pending', 'ready')
+      returning *
+    `
+
+    const runs = await tx<RunRow[]>`
+      update run set status = 'cancelled', finished_at = now()
+      where id = ${runId}
+      returning *
+    `
+    const run = runs[0]
+    if (!run) throw new Error(`finalizeCancelledRun: run "${runId}" vanished mid-transaction`)
+    return { run, cancelledSteps }
+  })
+}
+
+// The step-side half: what a worker does when it notices a cancel request
+// while it owns a `running` step. Same fence as sleepStep/lockStepIfOwner —
+// only the current lease holder may write this outcome, so a worker whose
+// lease was already reclaimed gets undefined and commits nothing instead of
+// cancelling a step its successor is midway through.
+export async function cancelRunningStep(
+  sql: Db,
+  args: { stepId: string; workerId: string }
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'cancelled',
+      lease_owner = null,
+      lease_expires_at = null,
+      updated_at = now()
+    where id = ${args.stepId} and status = 'running' and lease_owner = ${args.workerId}
+    returning *
+  `
+  return rows[0]
+}
+
+// What the cancellation sweep scans: requested but not yet finalized. Backed
+// by run_cancel_requested_idx (0003), a partial index on exactly this
+// predicate. Oldest request first so a cancel can't be starved by newer ones.
+export async function getCancelRequestedRuns(sql: Db): Promise<RunRow[]> {
+  return sql<RunRow[]>`
+    select * from run
+    where cancel_requested_at is not null and status in ('queued', 'running')
+    order by cancel_requested_at
+  `
+}
+
+// Observability + tests: which steps are asleep right now, as opposed to
+// sitting in retry backoff (both are `ready` with a future run_after — the
+// sleeping_until marker is the only thing that tells them apart).
+export async function getSleepingSteps(sql: Db, runId?: string): Promise<StepRow[]> {
+  const runFilter = runId ? sql`and run_id = ${runId}` : sql``
+  return sql<StepRow[]>`
+    select * from step
+    where status = 'ready' and sleeping_until > now()
+      ${runFilter}
+    order by sleeping_until
+  `
 }
 
 // ---- history -------------------------------------------------------------
