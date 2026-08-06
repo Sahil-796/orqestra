@@ -8,6 +8,18 @@
 // A worker never talks to `postgres` directly — only through
 // repositories.ts / queue/claim.ts / queue/lease.ts, same storage boundary
 // as engine/.
+//
+// Phase 3 adds three ways a claimed step can end other than "returned" or
+// "threw", all of them landing in this loop because this is the only place
+// that owns a lease while user code runs:
+//   #9  sleep     — the step asks to be suspended; we hand the row back to the
+//                   queue with a future run_after and release the worker.
+//   #10 timeout   — the step blows step.timeout_ms; it goes through the normal
+//                   failure/retry path, labelled so the timeline can tell why.
+//   #11 cancel    — the run was cancelled; the worker holding the lease is the
+//                   one that closes out its own step, cooperatively.
+// None of them weaken Phase 2's fencing: each is a fenced write in its own
+// transaction, and a worker that lost its lease writes nothing at all.
 
 import { hostname } from 'node:os'
 import { loadConfig } from '../config.ts'
@@ -18,16 +30,21 @@ import { heartbeatLease, releaseLease, reclaimExpiredLeases } from '../queue/lea
 import { advanceRun } from '../engine/executor.ts'
 import {
   cancelPendingSteps,
+  cancelRunningStep,
+  clearSleepMarker,
   completeStep,
   failStep,
+  finalizeCancelledRun,
   getRun,
   getWorkflowById,
+  isCancellationRequested,
   lockRun,
   lockStepIfOwner,
   markRunStarted,
   markStepReady,
   retryStep,
   insertHistory,
+  sleepStep,
   updateRunStatus,
   type RunRow,
   type StepRow,
@@ -36,6 +53,8 @@ import { serializeError } from '../types.ts'
 import { createWorkflowContext } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { DEFAULT_RETRY_POLICY, nextRunAfter, shouldRetry, type RetryPolicy } from '../engine/retry.ts'
+import { isSleepSignal, type SleepSignal } from '../engine/sleep.ts'
+import { isStepTimeoutError, withTimeout } from '../engine/timeout.ts'
 import { createLogger, type Logger } from '../observability/logger.ts'
 
 export interface WorkerOptions {
@@ -96,7 +115,21 @@ interface ResolvedRun {
 
 type StepOutcome =
   | { kind: 'success'; value: unknown }
-  | { kind: 'failure'; error: unknown; forcePermanent?: boolean }
+  // `timedOut` only changes the history label — a timeout is an ordinary
+  // failure as far as the retry/backoff decision is concerned (Phase 3 #10).
+  | { kind: 'failure'; error: unknown; forcePermanent?: boolean; timedOut?: boolean }
+
+// What one execution of a step function turned into, before any of it is
+// persisted. Phase 2 only had success/failure; Phase 3 adds two outcomes that
+// are NOT failures and must never be routed through the retry path:
+// `sleep` (the step asked to be suspended) and `cancelled` (the run was
+// cancelled underneath it).
+type Attempt =
+  | { kind: 'success'; value: unknown }
+  | { kind: 'sleep'; signal: SleepSignal }
+  | { kind: 'cancelled' }
+  | { kind: 'timeout'; error: unknown }
+  | { kind: 'failure'; error: unknown }
 
 export function createWorker(options: WorkerOptions): Worker {
   const db = options.db
@@ -183,6 +216,20 @@ export function createWorker(options: WorkerOptions): Worker {
 
       const error = serializeError(outcome.error)
 
+      // Logged before the retry/fail decision so the timeline can tell "the
+      // step blew its budget" apart from "the step threw", even though both
+      // take exactly the same path from here on. Deliberately additive: the
+      // step.retry_scheduled / step.failed row that follows is unchanged, so
+      // nothing reading Phase 2's history shape breaks.
+      if (outcome.timedOut) {
+        await insertHistory(tx, {
+          runId: run.id,
+          stepId: step.id,
+          type: 'step.timed_out',
+          data: { attempt: owned.attempt, timeoutMs: owned.timeout_ms, error },
+        })
+      }
+
       if (!outcome.forcePermanent && shouldRetry(owned.attempt, owned.max_attempts)) {
         const runAfter = nextRunAfter(owned.attempt, new Date(), retryPolicy)
         await retryStep(tx, step.id, error, runAfter)
@@ -205,6 +252,97 @@ export function createWorker(options: WorkerOptions): Worker {
       await cancelPendingSteps(tx, run.id)
       await insertHistory(tx, { runId: run.id, type: 'run.failed', data: { reason: 'step.failed', stepId: step.id } })
     })
+  }
+
+  // Sleep (#9). Same fencing discipline as commitOutcome — a sleep is a write
+  // that decides an outcome (it hands the step back to the queue with a future
+  // due time), so a worker whose lease was reclaimed mid-flight must write
+  // nothing rather than suspend a step its new owner is already running.
+  //
+  // What makes this cheap is what it does NOT do: no timer is set, no worker
+  // is parked, no connection is held. sleepStep parks the *row* — `ready` with
+  // `run_after = wakeAt` — and claimNextStep's existing `run_after <= now()`
+  // gate hides it from the whole fleet until it's due. A 24h sleep costs a
+  // timestamp in a column; every worker in the pool can be restarted during it
+  // and the wake time survives, because it was never in anyone's memory.
+  async function commitSleep(step: StepRow, run: RunRow, signal: SleepSignal): Promise<void> {
+    await withTransaction(db, async (tx) => {
+      const owned = await lockStepIfOwner(tx, step.id, workerId)
+      if (!owned) {
+        log.warn('lease fencing failed at sleep time — not suspending, another worker owns this step now', {
+          stepId: step.id,
+          runId: run.id,
+        })
+        return
+      }
+      await lockRun(tx, run.id)
+
+      // sleepStep re-asserts the same fence in its own WHERE clause; under the
+      // FOR UPDATE above it cannot miss, but it is the fence of record and a
+      // missing row still means "write nothing".
+      const slept = await sleepStep(tx, { stepId: step.id, workerId, wakeAt: signal.wakeAt })
+      if (!slept) return
+
+      await insertHistory(tx, {
+        runId: run.id,
+        stepId: step.id,
+        type: 'step.sleeping',
+        data: { wakeAt: signal.wakeAt, durationMs: signal.durationMs, seq: signal.seq },
+      })
+      // No releaseLease: sleepStep already cleared lease_owner/expires_at as
+      // part of handing the row back to the queue.
+    })
+  }
+
+  // Cancellation (#11), the step half. Cancellation is cooperative by design:
+  // the canceller only writes `cancel_requested_at` and never touches a
+  // `running` step, because doing so would be exactly the unfenced double-write
+  // Phase 2's commit fencing exists to make impossible. The worker that owns
+  // the lease is the only process allowed to close out its own step — so this
+  // runs here, fenced, and only then finalizes the run.
+  async function commitCancellation(step: StepRow, run: RunRow, phase: 'pre-run' | 'in-flight'): Promise<void> {
+    const cancelled = await withTransaction(db, async (tx) => {
+      const owned = await lockStepIfOwner(tx, step.id, workerId)
+      if (!owned) {
+        log.warn('lease fencing failed at cancel time — leaving this step to its new owner', {
+          stepId: step.id,
+          runId: run.id,
+        })
+        return false
+      }
+      // Same lock-first ordering as commitOutcome: take the run's FOR UPDATE
+      // before any insertHistory (which would otherwise acquire the weaker
+      // FOR KEY SHARE via the FK and set up a lock-upgrade deadlock with a
+      // sibling step committing concurrently).
+      await lockRun(tx, run.id)
+
+      const row = await cancelRunningStep(tx, { stepId: step.id, workerId })
+      if (!row) return false
+
+      await insertHistory(tx, {
+        runId: run.id,
+        stepId: step.id,
+        type: 'step.cancelled',
+        data: { phase, workerId },
+      })
+      return true
+    })
+
+    if (!cancelled) return
+
+    // Separate transaction on purpose: finalizeCancelledRun opens its own (it
+    // has to lock the run to flip the rest of the steps atomically), and the
+    // step above is already durably out of `running` by the time we get here,
+    // so there is nothing left in flight for this run from this worker.
+    const { run: finalized, cancelledSteps } = await finalizeCancelledRun(db, run.id)
+    if (finalized) {
+      await insertHistory(db, {
+        runId: run.id,
+        type: 'run.cancelled',
+        data: { reason: 'cancel_requested', stepId: step.id, cancelledSteps: cancelledSteps.length },
+      })
+      log.info('run cancelled', { runId: run.id, stepId: step.id, cancelledSteps: cancelledSteps.length })
+    }
   }
 
   async function runClaimedStep(
@@ -249,6 +387,30 @@ export function createWorker(options: WorkerOptions): Worker {
       return
     }
 
+    // Cancellation checkpoint #1: right after claiming, before a single line
+    // of the step function runs. A cancel request is not visible in
+    // `run.status` (the run stays `running` until someone finalizes it), so it
+    // takes its own read — and that read must be fresh, not the cached run row
+    // above. Starting work on a doomed run is pure waste, and this is also the
+    // gate that stops a step that fell asleep BEFORE the cancel from waking up
+    // and running: it wakes, gets claimed like any due step, and lands here.
+    if (await isCancellationRequested(db, run.id)) {
+      log.info('run was cancelled before this step started — cancelling the step instead of running it', {
+        stepId: step.id,
+        runId: run.id,
+      })
+      await commitCancellation(step, run, 'pre-run')
+      return
+    }
+
+    // A woken step is genuinely running again, so drop the "asleep" marker.
+    // Unfenced and best-effort by design (see clearSleepMarker): the column is
+    // observability only — nothing in the claim path reads it — so a stale
+    // write here can make a dashboard briefly wrong and nothing else.
+    if (step.sleeping_until !== null) {
+      await clearSleepMarker(db, step.id)
+    }
+
     if (run.status === 'queued') {
       // No-op-safe: markRunStarted only affects a row that's still
       // `queued`, so if several steps of a fresh run get claimed by
@@ -275,33 +437,115 @@ export function createWorker(options: WorkerOptions): Worker {
     // regardless, so even a race here (heartbeat fires *after* this check
     // but *before* the commit tx opens) is still caught correctly.
     let abandoned = false
+    // Cancellation checkpoint #2, and the reason it lives on the heartbeat
+    // tick: that timer already exists and already round-trips to Postgres
+    // every heartbeatIntervalMs, so noticing a cancel costs one extra cheap
+    // `exists(...)` on a connection we were using anyway — no new timer, no
+    // new poll loop. Aborting the controller is all a worker can do from the
+    // outside; whether the step actually stops is up to the step (see
+    // engine/timeout.ts on why JS has no preemption).
+    let cancelObserved = false
+    const cancelController = new AbortController()
     const heartbeatTimer = setInterval(() => {
       heartbeatLease(db, step.id, workerId, leaseTtlMs)
         .then((ok) => {
           if (!ok) {
             abandoned = true
             log.warn('lease lost mid-step — outcome will not be committed', { stepId: step.id, runId: run.id })
+            return
           }
+          if (cancelObserved) return
+          return isCancellationRequested(db, run.id).then((requested) => {
+            if (!requested) return
+            cancelObserved = true
+            log.info('cancellation requested while step was in flight — aborting its signal', {
+              stepId: step.id,
+              runId: run.id,
+            })
+            cancelController.abort(new Error(`orqestra: run ${run.id} was cancelled`))
+          })
         })
         .catch((e) => {
           log.error('heartbeat failed', { stepId: step.id, runId: run.id, error: serializeError(e) })
         })
     }, heartbeatIntervalMs)
 
+    // Classify one execution of the step function. Everything here is decided
+    // in memory; nothing is written until the commit* call below, so a lease
+    // that moved on can still discard all of it.
+    let attempt: Attempt
     try {
-      const ctx = createWorkflowContext({ runId: run.id, input: run.input })
-      try {
-        // Run the user function OUTSIDE any transaction — it may be slow or
-        // call out to the world. Only the outcome's persistence is atomic.
-        const value = await fn(ctx)
-        if (abandoned) return
-        await commitOutcome(step, run, { kind: 'success', value })
-      } catch (e) {
-        if (abandoned) return
-        await commitOutcome(step, run, { kind: 'failure', error: e })
+      // Run the user function OUTSIDE any transaction — it may be slow or
+      // call out to the world. Only the outcome's persistence is atomic.
+      //
+      // The context is built INSIDE withTimeout so `ctx.signal` is the
+      // combined signal (timeout ∪ cancellation), not one or the other:
+      // a step that watches its signal bails on whichever fires first.
+      // `sleepSeq` is what makes re-execution after a sleep converge — the
+      // step function restarts from the top (a JS stack cannot be frozen
+      // across a worker restart), and the context resolves the first
+      // `sleep_seq` sleep() calls immediately instead of suspending again.
+      const value = await withTimeout(
+        (signal) =>
+          fn(
+            createWorkflowContext({
+              runId: run.id,
+              input: run.input,
+              sleepSeq: step.sleep_seq,
+              signal,
+            })
+          ),
+        step.timeout_ms,
+        cancelController.signal
+      )
+      attempt = { kind: 'success', value }
+    } catch (e) {
+      // Order matters. A SleepSignal is control flow, not a failure, and must
+      // survive the timeout race untouched — withTimeout only ever *adds* a
+      // StepTimeoutError of its own, it never rewrites what fn threw, so a
+      // sleep that unwound before the budget expired arrives here intact.
+      if (isSleepSignal(e)) {
+        // ...unless the run is already cancelled, in which case suspending it
+        // for 24h just to cancel it on wake is silly. Cancel it now.
+        attempt = cancelObserved ? { kind: 'cancelled' } : { kind: 'sleep', signal: e }
+      } else if (cancelObserved) {
+        // Cancellation outranks the timeout label deliberately: once we abort
+        // the signal, a cooperative step throws (an AbortError, or its own
+        // error) and an uncooperative one may well go on to blow its budget —
+        // both are *consequences* of the cancel, and recording either as a
+        // timeout would blame the step for something we did to it.
+        attempt = { kind: 'cancelled' }
+      } else if (isStepTimeoutError(e)) {
+        attempt = { kind: 'timeout', error: e }
+      } else {
+        attempt = { kind: 'failure', error: e }
       }
     } finally {
       clearInterval(heartbeatTimer)
+    }
+
+    // The Phase 2 fast-path skip, unchanged and still not the safety
+    // mechanism: every commit* below re-checks ownership inside its own
+    // transaction, so losing the race between "the step settled" and "the
+    // heartbeat noticed" is caught there regardless.
+    if (abandoned) return
+
+    switch (attempt.kind) {
+      case 'success':
+        await commitOutcome(step, run, { kind: 'success', value: attempt.value })
+        return
+      case 'sleep':
+        await commitSleep(step, run, attempt.signal)
+        return
+      case 'cancelled':
+        await commitCancellation(step, run, 'in-flight')
+        return
+      case 'timeout':
+        await commitOutcome(step, run, { kind: 'failure', error: attempt.error, timedOut: true })
+        return
+      case 'failure':
+        await commitOutcome(step, run, { kind: 'failure', error: attempt.error })
+        return
     }
   }
 
