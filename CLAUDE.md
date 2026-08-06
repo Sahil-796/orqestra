@@ -19,8 +19,6 @@ bun run db:down        # stop Postgres
 
 Default DB: `postgres://orqestra:orqestra@localhost:5433/orqestra` (override via `DATABASE_URL`). Other env: `ORQ_POOL_SIZE`, `ORQ_LOG_LEVEL`, and the worker defaults `ORQ_LEASE_TTL_MS`, `ORQ_POLL_INTERVAL_MS`, `ORQ_WORKER_CONCURRENCY`. All parsed in `src/config.ts`, which fails fast on bad input.
 
-## Architecture — the load-bearing ideas
-
 ## The storage boundary (do not cross it)
 
 `engine/` (and everything outside `store/`) must know **nothing** about Postgres — it talks to storage only through typed functions in `src/store/repositories.ts`. Only `src/store/{client,migrate,repositories}.ts` may import the `postgres` package. This keeps correctness-critical logic unit-testable without a DB and leaves storage swappable. When adding queries, add a typed repository function; don't inline SQL elsewhere.
@@ -33,6 +31,7 @@ Default DB: `postgres://orqestra:orqestra@localhost:5433/orqestra` (override via
 - Results/errors persist as `jsonb`; use the `Result<T>` codec + `serializeError`/`deserializeError` in `src/types.ts` (raw `Error` objects are not JSON-safe).
 - Migrations are append-only numbered `.sql` files in `src/store/migrations/`, applied in one transaction each by the custom runner in `migrate.ts`.
 - Directories under `src/` (`engine/`, `queue/`, `worker/`, `triggers/`, `control/`) are `.gitkeep` placeholders reserved for their named phase — put new code in the folder that owns that concern rather than growing `store/` or `define/`.
+- For explainations and stuff use simple yet technical enough language
 
 ## Phase discipline
 
