@@ -1,19 +1,32 @@
 // WorkflowContext — the object step functions receive. Phase 0 only
-// declared the shape; Phase 1 (this file) makes `now`/`random` real since
-// they don't need any engine support. `sleep`/`waitForEvent` stay throwing
-// stubs until the engine capability that backs each one lands.
+// declared the shape; Phase 1 made `now`/`random` real since they don't need
+// any engine support. Phase 3 makes `sleep` real (backed by suspend +
+// requeue, see engine/sleep.ts) and exposes the abort `signal` that step
+// timeouts and run cancellation fire. `waitForEvent` stays a throwing stub
+// until Phase 5.
 //
-// Determinism note: `now()`/`random()` are NOT yet replay-recorded — a step
-// that re-runs after a crash will get a fresh Date/random value, not the
-// one it saw before. That's fine for Phase 1: the memoization boundary is
-// the whole step (a `completed` step is never re-run at all), so at-least-
-// once re-execution of an *incomplete* step simply re-sampling `now()`/
-// `random()` is still correct. Recording these for true deterministic
-// replay inside a single step is a future refinement (relevant once steps
-// can partially progress across a sleep/signal boundary).
+// Determinism note: `now()`/`random()` are NOT replay-recorded — they
+// re-sample on every execution of a step. Through Phase 2 that was invisible:
+// a `completed` step is never re-run, so only a *failed/crashed* attempt ever
+// saw fresh values, and that attempt's results were discarded anyway. Phase 3
+// changes this honestly — `ctx.sleep()` makes a step partially progress, get
+// suspended, and re-run **from the top** when it wakes, so code before the
+// sleep runs again and observes a different `now()`/`random()` than it did
+// pre-sleep. Steps that need a value to survive a sleep must derive it from
+// `ctx.input` (or persist it themselves) rather than from `now()`/`random()`.
+// Recording these for true deterministic replay is a future refinement.
+
+import { SleepSignal, parseDuration } from '../engine/sleep.ts'
 
 function notImplemented(feature: string, phase: string): never {
   throw new Error(`ctx.${feature} is not implemented yet (lands in ${phase})`)
+}
+
+// A signal that is never aborted — the default when no timeout/cancellation
+// is wired in, so `ctx.signal` is always a real AbortSignal and callers never
+// have to null-check it.
+function neverAbortedSignal(): AbortSignal {
+  return new AbortController().signal
 }
 
 export interface WorkflowContext {
@@ -21,6 +34,12 @@ export interface WorkflowContext {
   readonly input: unknown
   /** The run's stable id. */
   readonly runId: string
+
+  /**
+   * Aborted when this step's timeout elapses or the run is cancelled. Pass it
+   * to fetch/child work so an abandoned step stops burning resources.
+   */
+  readonly signal: AbortSignal
 
   /**
    * Deterministic clock — steps must use this instead of `Date.now()` so
@@ -34,20 +53,65 @@ export interface WorkflowContext {
    */
   random(): number
 
-  /** Suspend the run for a duration without holding a worker. Phase 3. */
+  /**
+   * Suspend the step for a duration without holding a worker or a connection.
+   * Never resolves in the suspend case — it throws a SleepSignal that the
+   * worker catches (see the replay note on createWorkflowContext).
+   */
   sleep(duration: string | number): Promise<void>
 
   /** Suspend the run until a named event arrives. Phase 5. */
   waitForEvent<T = unknown>(eventKey: string): Promise<T>
 }
 
-export function createWorkflowContext(input: { runId: string; input: unknown }): WorkflowContext {
+/**
+ * Build the context handed to a step function.
+ *
+ * **Sleep replay semantics — the subtle part of Phase 3.** A sleeping step
+ * goes back to `ready` with a future `run_after`; nothing about the step
+ * function's local state is saved. When the step is re-claimed it re-runs
+ * **from the very top**, so it will hit the same `ctx.sleep()` call again. To
+ * keep that from suspending forever, the durable row counts sleeps already
+ * served (`step.sleep_seq`) and this context replays against it: `sleep` keeps
+ * its own call counter, and any call whose 1-based index is `<= sleepSeq` has
+ * already been served on a previous execution and resolves immediately. Only
+ * the first call *beyond* `sleepSeq` actually suspends. So a step with two
+ * sleeps runs three times total: seq 1 suspends, then seq 1 is skipped and
+ * seq 2 suspends, then both are skipped and the step runs to completion.
+ *
+ * All new fields are optional — `createWorkflowContext({ runId, input })`
+ * keeps its Phase 1/2 behaviour (no sleeps served, never-aborted signal).
+ */
+export function createWorkflowContext(input: {
+  runId: string
+  input: unknown
+  /** How many sleeps this step has already served (step.sleep_seq). Default 0. */
+  sleepSeq?: number
+  /** Aborted on step timeout or run cancellation. Default: a never-aborted signal. */
+  signal?: AbortSignal
+}): WorkflowContext {
+  const alreadyServed = input.sleepSeq ?? 0
+  // Per-context (i.e. per-execution) counter of ctx.sleep() calls made so far.
+  let sleepCalls = 0
+
   return {
     input: input.input,
     runId: input.runId,
+    signal: input.signal ?? neverAbortedSignal(),
     now: () => new Date(),
     random: () => Math.random(),
-    sleep: () => notImplemented('sleep()', 'Phase 3'),
+    sleep: async (duration: string | number): Promise<void> => {
+      // Parse before the replay check so a malformed duration fails loudly on
+      // every execution, not only the one that would have suspended.
+      const durationMs = parseDuration(duration)
+      const seq = ++sleepCalls
+      if (seq <= alreadyServed) return
+      throw new SleepSignal({
+        wakeAt: new Date(Date.now() + durationMs),
+        durationMs,
+        seq,
+      })
+    },
     waitForEvent: () => notImplemented('waitForEvent()', 'Phase 5'),
   }
 }
