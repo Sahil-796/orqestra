@@ -5,6 +5,7 @@ import { createLogger, type Logger } from './observability/logger.ts'
 import { createDb, type Db } from './store/client.ts'
 import { migrate } from './store/migrate.ts'
 import * as repositories from './store/repositories.ts'
+import { cancelRun, type CancelResult } from './control/cancel.ts'
 
 export { defineWorkflow, getRegisteredWorkflow } from './define/workflow.ts'
 export type { WorkflowBuilder, WorkflowHandle, StepFn, StepOptions } from './define/workflow.ts'
@@ -14,8 +15,14 @@ export { createWorkflowContext } from './define/context.ts'
 export { startRun, executeRun, resumeRun, resumeAll, enqueueRun, advanceRun } from './engine/executor.ts'
 export type { StartRunOptions, RunResult, EnqueueRunResult, AdvanceResult } from './engine/executor.ts'
 
+export { SleepSignal, isSleepSignal, parseDuration } from './engine/sleep.ts'
+export { StepTimeoutError, isStepTimeoutError, withTimeout } from './engine/timeout.ts'
+
 export { createWorker } from './worker/worker.ts'
 export type { Worker, WorkerOptions } from './worker/worker.ts'
+
+export { cancelRun, isRunCancelled, sweepCancelledRuns } from './control/cancel.ts'
+export type { CancelResult } from './control/cancel.ts'
 
 export type { OrqConfig, LogLevel } from './config.ts'
 export { loadConfig } from './config.ts'
@@ -49,6 +56,15 @@ export class Orquestra {
   /** Run pending migrations against this instance's database. */
   async migrate(): Promise<string[]> {
     return migrate(this.db)
+  }
+
+  /**
+   * Request cancellation of a run. Cooperative: see cancelRun — the result
+   * tells you whether the run is already `cancelled` or whether a worker
+   * still has to observe the request and finalize it.
+   */
+  async cancel(runId: string): Promise<CancelResult> {
+    return cancelRun(this.db, runId)
   }
 
   async close(): Promise<void> {
