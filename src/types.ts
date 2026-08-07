@@ -1,0 +1,110 @@
+// core types shared across the engine + a jsonb-safe Result codec
+
+export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export type StepStatus = 'pending' | 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export const RUN_STATUSES: readonly RunStatus[] = [
+  'queued',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+]
+
+export const STEP_STATUSES: readonly StepStatus[] = [
+  'pending',
+  'ready',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+]
+
+// ---- workflow / step definitions -----------------------------------------
+//
+// A `WorkflowDefinition` is the serializable DAG persisted into
+// `workflow.dag`. It carries no functions — step implementations live only
+// in-process (registered via defineWorkflow), keyed by step name, so the
+// engine can look them up when it replays a run.
+
+export interface StepDefinition {
+  name: string
+  dependsOn: string[]
+  maxAttempts: number
+  timeoutMs?: number
+  priority: number
+}
+
+export interface WorkflowDefinition {
+  name: string
+  version: number
+  steps: StepDefinition[]
+}
+
+// ---- Result codec ---------------------------------------------------------
+//
+// Step results/errors are stored in jsonb columns. `Error` instances aren't
+// JSON-safe on their own (message/stack are non-enumerable), so we codec
+// them to/from a plain shape that survives a jsonb round-trip.
+
+export interface SerializedError {
+  name: string
+  message: string
+  stack?: string
+  cause?: unknown
+}
+
+export type Result<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: SerializedError }
+
+export function ok<T>(value: T): Result<T> {
+  return { ok: true, value }
+}
+
+export function err<T = never>(error: unknown): Result<T> {
+  return { ok: false, error: serializeError(error) }
+}
+
+export function serializeError(error: unknown): SerializedError {
+  if (error instanceof Error) {
+    const serialized: SerializedError = {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    }
+    if ('cause' in error) serialized.cause = error.cause
+    return serialized
+  }
+  return {
+    name: 'NonErrorThrown',
+    message: typeof error === 'string' ? error : JSON.stringify(error),
+  }
+}
+
+export function deserializeError(serialized: SerializedError): Error {
+  const error = new Error(serialized.message)
+  error.name = serialized.name
+  if (serialized.stack) error.stack = serialized.stack
+  if ('cause' in serialized) (error as { cause?: unknown }).cause = serialized.cause
+  return error
+}
+
+/** Serialize a Result<T> to a plain JSON-safe value for a jsonb column. */
+export function encodeResult<T>(result: Result<T>): unknown {
+  return result
+}
+
+/** Parse a value read back from a jsonb column into a Result<T>. */
+export function decodeResult<T>(raw: unknown): Result<T> {
+  if (
+    raw !== null &&
+    typeof raw === 'object' &&
+    'ok' in raw &&
+    typeof (raw as { ok: unknown }).ok === 'boolean'
+  ) {
+    return raw as Result<T>
+  }
+  throw new Error(`decodeResult: value is not a valid Result: ${JSON.stringify(raw)}`)
+}

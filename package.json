@@ -2,6 +2,12 @@
   "name": "orqestra",
   "module": "index.ts",
   "type": "module",
+  "scripts": {
+    "migrate": "bun run src/store/migrate.ts",
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "test": "bun test"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
@@ -10,8 +16,6 @@
   },
   "dependencies": {
     "@types/node": "^25.3.3",
-    "@types/uuid": "^11.0.0",
-    "ioredis": "^5.10.0",
-    "uuid": "^13.0.0"
+    "postgres": "^3.4.9"
   }
 }

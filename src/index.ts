@@ -1,29 +1,78 @@
-import type Redis from 'ioredis'
-import { createRedisClient } from './core/redis'
-import { WorkflowBuilder } from './core/workflow'
+// Public API surface for orqestra.
 
+import { loadConfig } from './config.ts'
+import { createLogger, type Logger } from './observability/logger.ts'
+import { createDb, type Db } from './store/client.ts'
+import { migrate } from './store/migrate.ts'
+import * as repositories from './store/repositories.ts'
+import { cancelRun, type CancelResult } from './control/cancel.ts'
+
+export { defineWorkflow, getRegisteredWorkflow } from './define/workflow.ts'
+export type { WorkflowBuilder, WorkflowHandle, StepFn, StepOptions } from './define/workflow.ts'
+export type { WorkflowContext } from './define/context.ts'
+export { createWorkflowContext } from './define/context.ts'
+
+export { startRun, executeRun, resumeRun, resumeAll, enqueueRun, advanceRun } from './engine/executor.ts'
+export type { StartRunOptions, RunResult, EnqueueRunResult, AdvanceResult } from './engine/executor.ts'
+
+export { SleepSignal, isSleepSignal, parseDuration } from './engine/sleep.ts'
+export { StepTimeoutError, isStepTimeoutError, withTimeout } from './engine/timeout.ts'
+
+export { createWorker } from './worker/worker.ts'
+export type { Worker, WorkerOptions } from './worker/worker.ts'
+
+export { cancelRun, isRunCancelled, sweepCancelledRuns } from './control/cancel.ts'
+export type { CancelResult } from './control/cancel.ts'
+
+export type { OrqConfig, LogLevel } from './config.ts'
+export { loadConfig } from './config.ts'
+
+export * from './types.ts'
+
+export { createDb, getDb, withTransaction, closeDb } from './store/client.ts'
+export type { Db } from './store/client.ts'
+export { migrate } from './store/migrate.ts'
+export { repositories }
+
+export { createLogger } from './observability/logger.ts'
+export type { Logger, LogFields } from './observability/logger.ts'
+
+/**
+ * Orquestra — the Postgres-backed client. Phase 0 only wires up config,
+ * storage, and logging; running workflows lands in Phase 1+.
+ */
 export class Orquestra {
-  private redis: Redis
-  private prefix: string
-  private workflows = new Map<string, WorkflowBuilder>()
+  readonly db: Db
+  readonly logger: Logger
 
-  constructor(redisUrl: string, prefix = 'orq') {
-    this.prefix = prefix
-    this.redis = createRedisClient(redisUrl, prefix)
+  constructor(options: { databaseUrl?: string } = {}) {
+    const config = loadConfig(
+      options.databaseUrl ? { ...process.env, DATABASE_URL: options.databaseUrl } : process.env
+    )
+    this.db = createDb(config)
+    this.logger = createLogger(config.logLevel)
   }
 
-  define(name: string): WorkflowBuilder {
-    const workflow = new WorkflowBuilder(this.redis)
-    this.workflows.set(name, workflow)
-    return workflow
+  /** Run pending migrations against this instance's database. */
+  async migrate(): Promise<string[]> {
+    return migrate(this.db)
   }
-  
-  //run workflow using orq
-  async run(name: string, initialCtx: Record<string, unknown> = {}): Promise<unknown> { 
-    const workflow = this.workflows.get(name)
-    if (!workflow) throw new Error(`Workflow ${name} not found`)
-    return await workflow.run(initialCtx)
+
+  /**
+   * Request cancellation of a run. Cooperative: see cancelRun — the result
+   * tells you whether the run is already `cancelled` or whether a worker
+   * still has to observe the request and finalize it.
+   */
+  async cancel(runId: string): Promise<CancelResult> {
+    return cancelRun(this.db, runId)
+  }
+
+  async close(): Promise<void> {
+    await this.db.end()
   }
 }
 
-export const orquestra = (redisUrl: string, prefix = 'orq') => new Orquestra(redisUrl, prefix)
+/** Create an Orquestra client. Defaults to DATABASE_URL / the local docker db. */
+export function orquestra(options: { databaseUrl?: string } = {}): Orquestra {
+  return new Orquestra(options)
+}

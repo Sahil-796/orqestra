@@ -1,0 +1,664 @@
+<title>orqestra — Build Plan</title>
+<style>
+  :root {
+    --bg: #F4F5F7;
+    --surface: #FFFFFF;
+    --surface-2: #F0F1F4;
+    --border: #E1E4EA;
+    --border-strong: #CBD0DA;
+    --ink: #191E27;
+    --ink-soft: #3C4552;
+    --muted: #626C7C;
+    --faint: #8A93A2;
+    --accent: #A96A1C;      /* brass, on light */
+    --accent-soft: #F3E6D2;
+    --accent-line: #E7D3B4;
+    /* semantic status — kept distinct from the brand accent */
+    --st-queued: #5E7290;
+    --st-running: #2F7FC4;
+    --st-done: #3C8A5E;
+    --st-failed: #C0453D;
+    --st-queued-bg: #E7ECF3;
+    --st-running-bg: #E1EEF9;
+    --st-done-bg: #E1F1E8;
+    --st-failed-bg: #F8E4E2;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --maxw: 1080px;
+    --radius: 4px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0E1117;
+      --surface: #161B22;
+      --surface-2: #1B212B;
+      --border: #262D38;
+      --border-strong: #333C49;
+      --ink: #E7EBF2;
+      --ink-soft: #C2C9D4;
+      --muted: #8C95A4;
+      --faint: #667180;
+      --accent: #E0A458;
+      --accent-soft: #2A2114;
+      --accent-line: #4A3B22;
+      --st-queued: #8AA0C0;
+      --st-running: #58A6E0;
+      --st-done: #5FBE86;
+      --st-failed: #E0736B;
+      --st-queued-bg: #1B2330;
+      --st-running-bg: #142430;
+      --st-done-bg: #142519;
+      --st-failed-bg: #2A1715;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #F4F5F7; --surface: #FFFFFF; --surface-2: #F0F1F4; --border: #E1E4EA;
+    --border-strong: #CBD0DA; --ink: #191E27; --ink-soft: #3C4552; --muted: #626C7C;
+    --faint: #8A93A2; --accent: #A96A1C; --accent-soft: #F3E6D2; --accent-line: #E7D3B4;
+    --st-queued: #5E7290; --st-running: #2F7FC4; --st-done: #3C8A5E; --st-failed: #C0453D;
+    --st-queued-bg: #E7ECF3; --st-running-bg: #E1EEF9; --st-done-bg: #E1F1E8; --st-failed-bg: #F8E4E2;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0E1117; --surface: #161B22; --surface-2: #1B212B; --border: #262D38;
+    --border-strong: #333C49; --ink: #E7EBF2; --ink-soft: #C2C9D4; --muted: #8C95A4;
+    --faint: #667180; --accent: #E0A458; --accent-soft: #2A2114; --accent-line: #4A3B22;
+    --st-queued: #8AA0C0; --st-running: #58A6E0; --st-done: #5FBE86; --st-failed: #E0736B;
+    --st-queued-bg: #1B2330; --st-running-bg: #142430; --st-done-bg: #142519; --st-failed-bg: #2A1715;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 28px; }
+
+  /* ---- top bar ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: saturate(1.4) blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar .wrap { display: flex; align-items: center; gap: 20px; height: 52px; }
+  .brand { font-family: var(--mono); font-weight: 600; letter-spacing: -0.02em; font-size: 15px; }
+  .brand b { color: var(--accent); }
+  .topnav { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+  .topnav a {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    text-decoration: none; padding: 5px 9px; border-radius: var(--radius);
+  }
+  .topnav a:hover { color: var(--ink); background: var(--surface-2); }
+  @media (max-width: 760px) { .topnav { display: none; } }
+
+  /* ---- hero ---- */
+  .hero { padding: 72px 0 40px; border-bottom: 1px solid var(--border); }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 600; letter-spacing: -0.03em;
+    font-size: clamp(38px, 6vw, 62px); line-height: 1.02; margin: 0 0 20px;
+    text-wrap: balance;
+  }
+  h1 .dim { color: var(--faint); }
+  .lede { font-size: clamp(17px, 2.4vw, 20px); color: var(--ink-soft); max-width: 62ch; margin: 0 0 28px; }
+  .metarow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tag {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; background: var(--surface);
+  }
+  .tag b { color: var(--ink); font-weight: 600; }
+
+  /* ---- pipeline motif ---- */
+  .pipe { display: flex; align-items: center; gap: 0; margin: 40px 0 4px; overflow-x: auto; padding-bottom: 6px; }
+  .node {
+    display: flex; flex-direction: column; align-items: center; gap: 8px; flex: 0 0 auto;
+  }
+  .dot {
+    width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    border: 1.5px solid currentColor;
+  }
+  .node small { font-family: var(--mono); font-size: 10.5px; color: var(--muted); letter-spacing: 0.04em; }
+  .edge { flex: 1 1 auto; min-width: 26px; height: 2px; background: var(--border-strong); position: relative; }
+  .edge::after {
+    content: ""; position: absolute; inset: 0; background: var(--accent);
+    transform-origin: left; animation: flow 3.4s ease-in-out infinite;
+  }
+  .edge.e2::after { animation-delay: 0.5s; }
+  .edge.e3::after { animation-delay: 1.0s; }
+  .edge.e4::after { animation-delay: 1.5s; }
+  @keyframes flow { 0%,100% { transform: scaleX(0); opacity: 0; } 40% { transform: scaleX(1); opacity: 1; } 70% { transform: scaleX(1); opacity: 0.15; } }
+  .n-queued { color: var(--st-queued); background: var(--st-queued-bg); }
+  .n-run    { color: var(--st-running); background: var(--st-running-bg); }
+  .n-done   { color: var(--st-done); background: var(--st-done-bg); }
+  .n-fail   { color: var(--st-failed); background: var(--st-failed-bg); }
+  @media (prefers-reduced-motion: reduce) { .edge::after { animation: none; transform: scaleX(1); opacity: 0.4; } }
+
+  /* ---- sections ---- */
+  section { padding: 56px 0; border-bottom: 1px solid var(--border); }
+  .sec-head { display: flex; align-items: baseline; gap: 14px; margin: 0 0 8px; }
+  .sec-num { font-family: var(--mono); font-size: 13px; color: var(--accent); font-weight: 600; }
+  h2 { font-family: var(--mono); font-weight: 600; letter-spacing: -0.02em; font-size: clamp(24px, 3.4vw, 32px); margin: 0; text-wrap: balance; }
+  .sec-sub { color: var(--muted); max-width: 66ch; margin: 6px 0 32px; }
+  h3 { font-family: var(--mono); font-weight: 600; font-size: 17px; letter-spacing: -0.01em; margin: 0 0 8px; }
+  p { margin: 0 0 14px; }
+  a.inline { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-line); }
+
+  /* ---- decision callout ---- */
+  .callout {
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: var(--radius);
+    padding: 22px 24px; margin: 0 0 20px;
+  }
+  .callout .k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+  .callout h3 { margin-bottom: 10px; }
+  .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .twocol { grid-template-columns: 1fr; } }
+  .vs { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+  .vs h4 { font-family: var(--mono); font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .vs ul { margin: 0; padding-left: 18px; color: var(--ink-soft); font-size: 14.5px; }
+  .vs li { margin-bottom: 6px; }
+  .pill { font-family: var(--mono); font-size: 10px; padding: 2px 8px; border-radius: 999px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 600; }
+  .pill.pick { background: var(--st-done-bg); color: var(--st-done); }
+  .pill.aux  { background: var(--st-queued-bg); color: var(--st-queued); }
+
+  /* ---- principle grid ---- */
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 820px) { .grid3 { grid-template-columns: 1fr; } }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .card .ico { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: 0.1em; text-transform: uppercase; margin: 0 0 10px; }
+  .card p { font-size: 14.5px; color: var(--ink-soft); margin: 0; }
+
+  /* ---- code block ---- */
+  pre {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px 20px; overflow-x: auto; margin: 0 0 18px;
+    font-family: var(--mono); font-size: 13px; line-height: 1.7; color: var(--ink-soft);
+  }
+  pre .c { color: var(--faint); }
+  pre .kw { color: var(--accent); }
+  pre .st { color: var(--st-done); }
+
+  /* ---- phase / movement rail ---- */
+  .phase {
+    display: grid; grid-template-columns: 64px 1fr; gap: 0; position: relative;
+  }
+  .phase + .phase { margin-top: 8px; }
+  .rail { display: flex; flex-direction: column; align-items: center; }
+  .rail .num {
+    width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center;
+    font-family: var(--mono); font-weight: 600; font-size: 14px;
+    background: var(--surface); border: 1.5px solid var(--border-strong); color: var(--ink);
+    z-index: 2;
+  }
+  .phase.done .num { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .rail .line { flex: 1; width: 2px; background: var(--border); margin: 4px 0; min-height: 24px; }
+  .phase:last-child .rail .line { display: none; }
+  .pbody { padding: 4px 0 28px 8px; }
+  .pbody .ptop { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+  .pbody h3 { margin: 0; font-size: 19px; }
+  .ptitle-note { font-family: var(--mono); font-size: 11px; color: var(--faint); letter-spacing: 0.06em; }
+  .goal { color: var(--ink-soft); margin: 6px 0 14px; max-width: 64ch; }
+  .feat { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .fchip {
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft);
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 3px 9px;
+  }
+  .fchip b { color: var(--accent); font-weight: 600; }
+  .ship {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    border-top: 1px dashed var(--border-strong); padding-top: 10px;
+  }
+  .ship b { color: var(--st-done); }
+
+  /* ---- coverage matrix ---- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 620px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  thead th { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); background: var(--surface-2); position: sticky; top: 0; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--surface); }
+  td.id { font-family: var(--mono); color: var(--faint); font-variant-numeric: tabular-nums; width: 44px; }
+  .ph { font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+
+  /* ---- enhancements ---- */
+  .enh { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 720px) { .enh { grid-template-columns: 1fr; } }
+  .enh .card h3 { font-size: 15px; margin-bottom: 6px; }
+  .enh .card .badge { font-family: var(--mono); font-size: 10px; color: var(--st-running); background: var(--st-running-bg); padding: 2px 7px; border-radius: 999px; letter-spacing: 0.06em; text-transform: uppercase; }
+
+  /* ---- risks ---- */
+  .risk { display: flex; gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--border); }
+  .risk:last-child { border-bottom: none; }
+  .risk .sev { font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 8px; border-radius: var(--radius); height: fit-content; white-space: nowrap; }
+  .sev.high { background: var(--st-failed-bg); color: var(--st-failed); }
+  .sev.med { background: var(--st-running-bg); color: var(--st-running); }
+  .risk .rbody h4 { font-family: var(--mono); font-size: 14px; margin: 0 0 4px; }
+  .risk .rbody p { font-size: 14px; color: var(--ink-soft); margin: 0; }
+
+  footer { padding: 40px 0 64px; }
+  footer p { font-family: var(--mono); font-size: 12px; color: var(--faint); margin: 0; }
+
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+</style>
+
+<div class="topbar">
+  <div class="wrap">
+    <span class="brand">orq<b>estra</b></span>
+    <nav class="topnav">
+      <a href="#decision">Architecture</a>
+      <a href="#model">Data model</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#matrix">Coverage</a>
+      <a href="#tree">Structure</a>
+      <a href="#extras">Worth stealing</a>
+      <a href="#risks">Risks</a>
+    </nav>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Build plan · durable workflow engine</p>
+    <h1>A conductor for <span class="dim">durable,</span> crash-proof workflows.</h1>
+    <p class="lede">
+      orqestra runs multi-step workflows that survive process crashes, retry themselves, sleep for
+      days without holding a worker, and fan out across a pool of concurrent workers — the Temporal / Inngest
+      idea, built lean on Postgres and Bun. This is the sequenced plan to get there from the current bare skeleton.
+    </p>
+    <div class="metarow">
+      <span class="tag"><b>Bun</b> + TypeScript</span>
+      <span class="tag"><b>Postgres</b> — durable source of truth</span>
+      <span class="tag"><b>Redis</b> — hot-path coordination</span>
+      <span class="tag"><b>35</b> features · <b>9</b> phases</span>
+    </div>
+
+    <div class="pipe" aria-hidden="true">
+      <div class="node"><span class="dot n-done">✓</span><small>trigger</small></div>
+      <div class="edge e1"></div>
+      <div class="node"><span class="dot n-done">✓</span><small>queue</small></div>
+      <div class="edge e2"></div>
+      <div class="node"><span class="dot n-run">▶</span><small>lease</small></div>
+      <div class="edge e3"></div>
+      <div class="node"><span class="dot n-run">◴</span><small>execute</small></div>
+      <div class="edge e4"></div>
+      <div class="node"><span class="dot n-queued">⋯</span><small>sleep 24h</small></div>
+    </div>
+  </div>
+</header>
+
+<section id="decision">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">01</span><h2>The one decision to make first</h2></div>
+    <p class="sec-sub">
+      Your current code leases everything off Redis, but requirement #5 asks for a <em>Postgres-backed queue</em>.
+      That is not a detail — it decides how durability and idempotency work for every feature after it. Settle it now.
+    </p>
+
+    <div class="callout">
+      <p class="k">Recommendation</p>
+      <h3>Postgres is the system of record. Redis is an accelerator you can add later — never the source of truth.</h3>
+      <p style="margin:0;color:var(--ink-soft)">
+        Every durable fact — run state, step results, queue rows, leases, timers, event subscriptions — lives in
+        Postgres and is mutated inside transactions. Postgres alone can carry the whole engine to production using
+        <code style="font-family:var(--mono);font-size:13px;color:var(--accent)">SELECT … FOR UPDATE SKIP LOCKED</code>
+        as the queue primitive. Reach for Redis only when a specific hot path (rate-limit counters, pub/sub wakeups,
+        concurrency tokens) actually hurts — and keep it as cache/coordination, so a Redis flush never loses work.
+      </p>
+    </div>
+
+    <div class="twocol">
+      <div class="vs">
+        <h4>Postgres <span class="pill pick">source of truth</span></h4>
+        <ul>
+          <li>Transactions give you exactly-once step commits for free — claim, run, persist result in one atomic unit.</li>
+          <li><code>FOR UPDATE SKIP LOCKED</code> is a correct, contention-free queue with no extra infra.</li>
+          <li>Crash recovery is just "read the rows" — state was never only in memory.</li>
+          <li>Leases, timers, and DLQ are all just indexed columns and timestamps.</li>
+        </ul>
+      </div>
+      <div class="vs">
+        <h4>Redis <span class="pill aux">optional accelerator</span></h4>
+        <ul>
+          <li>Sub-millisecond counters for rate limits (#13) and concurrency tokens (#12).</li>
+          <li>Pub/sub to wake idle workers instantly instead of polling.</li>
+          <li>Ephemeral by nature — a wipe must only cost latency, never a lost run.</li>
+          <li>Introduce it in Phase 6, not Phase 0. Don't couple correctness to it.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="principles">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">02</span><h2>Invariants the whole engine leans on</h2></div>
+    <p class="sec-sub">Four properties that, if you hold them from day one, make every later feature a small addition instead of a rewrite.</p>
+    <div class="grid3">
+      <div class="card"><p class="ico">Determinism</p><p>Workflow code is replayed on recovery. Completed steps must return their <em>recorded</em> result, not re-run. The function is a plan; the log is the truth.</p></div>
+      <div class="card"><p class="ico">Idempotency</p><p>Every start carries an idempotency key; every step has a stable id. Duplicate triggers and duplicate side effects both collapse to one committed outcome.</p></div>
+      <div class="card"><p class="ico">Durable-by-default</p><p>Nothing exists only in a worker's memory. A step isn't "done" until its result is committed to Postgres in the same tx that advances the run.</p></div>
+      <div class="card"><p class="ico">At-least-once delivery</p><p>Workers can die mid-step, so steps run at-least-once. Idempotency + result memoization turn that into effectively exactly-once.</p></div>
+      <div class="card"><p class="ico">Leases, not locks</p><p>A worker claims work with an expiring lease. Crash → lease expires → another worker reclaims. No job is ever permanently stuck behind a dead worker.</p></div>
+      <div class="card"><p class="ico">Two run modes, on purpose</p><p>Inline <code>run()</code> for tests/local synchronous execution; durable <code>enqueue()</code> for the real queue-backed path. Same definition, two executors.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="model">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">03</span><h2>Core data model</h2></div>
+    <p class="sec-sub">The minimal schema that makes durability, queueing, leasing, timers, and history all fall out of the same tables. Everything advanced is a column or an index on top of this.</p>
+    <pre><span class="c">-- a registered workflow definition + version (versioning matters for long-running runs)</span>
+<span class="kw">workflow</span>        ( id, name, version, dag jsonb, created_at )
+
+<span class="c">-- one execution of a workflow</span>
+<span class="kw">run</span>             ( id, workflow_id, status, priority, input jsonb, output jsonb,
+                  idempotency_key <span class="st">unique</span>, created_at, started_at, finished_at )
+
+<span class="c">-- the queue AND the durable step log, unified</span>
+<span class="kw">step</span>            ( id, run_id, name, status, attempt, max_attempts,
+                  result jsonb, error jsonb, depends_on text[],
+                  run_after timestamptz,        <span class="c">-- sleep / delay / backoff</span>
+                  lease_owner, lease_expires_at, <span class="c">-- leasing</span>
+                  timeout_ms, priority )
+
+<span class="c">-- things a run is blocked on: an external signal / event</span>
+<span class="kw">signal_wait</span>     ( id, run_id, event_key, satisfied_at )
+<span class="kw">event</span>           ( id, key, payload jsonb, received_at )
+
+<span class="c">-- append-only observability spine</span>
+<span class="kw">history</span>         ( id, run_id, step_id, type, data jsonb, at )   <span class="c">-- timeline + logs</span>
+<span class="kw">dead_letter</span>     ( id, run_id, reason, snapshot jsonb, at )
+
+<span class="c">-- the claim query every worker runs, in a tx:</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> step
+ <span class="kw">WHERE</span> status = <span class="st">'ready'</span> <span class="kw">AND</span> run_after &lt;= now()
+   <span class="kw">AND</span> (lease_expires_at <span class="kw">IS NULL OR</span> lease_expires_at &lt; now())
+ <span class="kw">ORDER BY</span> priority <span class="kw">DESC</span>, run_after
+ <span class="kw">FOR UPDATE SKIP LOCKED</span> <span class="kw">LIMIT</span> 1;</pre>
+    <p style="color:var(--muted);font-size:14px;margin:0">
+      That single claim query is the beating heart of the engine — queue (#5), workers (#6), leasing (#7), priorities (#14),
+      delayed/sleep steps (#9), and retry backoff (#4) are all just predicates and columns on it.
+    </p>
+  </div>
+</section>
+
+<section id="roadmap">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">04</span><h2>The roadmap — nine movements</h2></div>
+    <p class="sec-sub">
+      Ordered so each phase produces something runnable and the hardest correctness problems (durability, recovery, leasing)
+      are solved before the fun orchestration features sit on top. Build depth-first: a thin slice working end-to-end beats
+      ten half-features.
+    </p>
+
+    <!-- P0 -->
+    <div class="phase done">
+      <div class="rail"><span class="num">0</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Foundation &amp; the pivot</h3><span class="ptitle-note">// clean the slate</span></div>
+        <p class="goal">Restructure the repo, stand up Postgres + migrations, and define the core types. This is where you decide the folder layout you won't fight later, and cut over from redis-only to the Postgres model above.</p>
+        <div class="feat">
+          <span class="fchip">postgres + migration runner</span>
+          <span class="fchip">core types &amp; result codec</span>
+          <span class="fchip">structured logger</span>
+          <span class="fchip">config / env</span>
+        </div>
+        <div class="ship">Ships: <b>a migration that creates the schema, and a typed <code>defineWorkflow()</code> that registers a DAG.</b></div>
+      </div>
+    </div>
+
+    <!-- P1 -->
+    <div class="phase done">
+      <div class="rail"><span class="num">1</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Durable core (single process)</h3><span class="ptitle-note">// correctness before scale</span></div>
+        <p class="goal">Execute a workflow as a sequence of steps, persisting every step's status and result, and prove you can kill the process mid-run and resume exactly where it stopped. No queue yet — just one executor and the log.</p>
+        <div class="feat">
+          <span class="fchip"><b>#1</b> workflow definitions</span>
+          <span class="fchip"><b>#2</b> durable step execution</span>
+          <span class="fchip"><b>#3</b> crash recovery</span>
+          <span class="fchip"><b>#8</b> idempotency</span>
+        </div>
+        <div class="ship">Ships: <b>a workflow that <code>kill -9</code>s halfway and resumes without re-running completed steps.</b></div>
+      </div>
+    </div>
+
+    <!-- P2 -->
+    <div class="phase done">
+      <div class="rail"><span class="num">2</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Queue, workers &amp; leasing</h3><span class="ptitle-note">// go distributed</span></div>
+        <p class="goal">Turn the step log into a claimable queue. Run N worker processes that pull work with expiring leases, and add configurable retries with exponential backoff. Now a crashed worker's job is reclaimed, and transient failures self-heal.</p>
+        <div class="feat">
+          <span class="fchip"><b>#5</b> run queue (Postgres)</span>
+          <span class="fchip"><b>#6</b> concurrent workers</span>
+          <span class="fchip"><b>#7</b> leasing + reclaim</span>
+          <span class="fchip"><b>#4</b> retries + backoff</span>
+        </div>
+        <div class="ship">Ships: <b>3 workers draining one queue; kill one mid-step and its lease is reclaimed within the lease TTL.</b></div>
+      </div>
+    </div>
+
+    <!-- P3 -->
+    <div class="phase done">
+      <div class="rail"><span class="num">3</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Execution control</h3><span class="ptitle-note">// time &amp; kill switches</span></div>
+        <p class="goal">Steps can now sleep for hours without pinning a worker (just <code>run_after</code> in the future), exceed a timeout and be marked/killed, and whole runs or single executions can be cancelled cooperatively.</p>
+        <div class="feat">
+          <span class="fchip"><b>#9</b> sleep / delayed steps</span>
+          <span class="fchip"><b>#10</b> step timeouts</span>
+          <span class="fchip"><b>#11</b> cancellation</span>
+        </div>
+        <div class="ship">Ships: <b><code>await ctx.sleep("24h")</code> that releases the worker and wakes on schedule.</b></div>
+      </div>
+    </div>
+
+    <!-- P4 -->
+    <div class="phase">
+      <div class="rail"><span class="num">4</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Orchestration &amp; DAGs</h3><span class="ptitle-note">// the good stuff</span></div>
+        <p class="goal">Steps run when their dependencies complete; branches fan out to run in parallel and fan back in; results steer conditional paths; and a workflow can spawn and await a child workflow. This is where the <code>depends_on</code> column earns its keep.</p>
+        <div class="feat">
+          <span class="fchip"><b>#19</b> step dependencies / DAG</span>
+          <span class="fchip"><b>#15</b> fan-out</span>
+          <span class="fchip"><b>#16</b> fan-in</span>
+          <span class="fchip"><b>#17</b> conditional branching</span>
+          <span class="fchip"><b>#20</b> child workflows</span>
+        </div>
+        <div class="ship">Ships: <b>a run that fans out to 10 parallel steps and continues only when all 10 commit.</b></div>
+      </div>
+    </div>
+
+    <!-- P5 -->
+    <div class="phase">
+      <div class="rail"><span class="num">5</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Signals &amp; triggers</h3><span class="ptitle-note">// ways in</span></div>
+        <p class="goal">Runs can pause until an external event arrives, and get started five different ways: a direct API call, an internal event, a cron schedule, a future timestamp, or an inbound webhook. The engine stops being a library you call and becomes a service that reacts.</p>
+        <div class="feat">
+          <span class="fchip"><b>#18</b> wait-for-event / signals</span>
+          <span class="fchip"><b>#21</b> API triggers</span>
+          <span class="fchip"><b>#22</b> event triggers</span>
+          <span class="fchip"><b>#23</b> cron / scheduled</span>
+          <span class="fchip"><b>#24</b> delayed starts</span>
+          <span class="fchip"><b>#25</b> webhook ingestion</span>
+        </div>
+        <div class="ship">Ships: <b>a workflow that blocks on <code>ctx.waitForEvent("payment.confirmed")</code> and resumes when a webhook posts it.</b></div>
+      </div>
+    </div>
+
+    <!-- P6 -->
+    <div class="phase">
+      <div class="rail"><span class="num">6</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Flow control at scale</h3><span class="ptitle-note">// backpressure · Redis enters</span></div>
+        <p class="goal">Protect downstream systems: cap how many of a given step run at once, throttle external calls per minute, and let urgent runs jump the line. This is the natural first home for Redis counters — but the limits stay <em>correct</em> even if you implement them in Postgres first.</p>
+        <div class="feat">
+          <span class="fchip"><b>#12</b> concurrency limits</span>
+          <span class="fchip"><b>#13</b> rate limiting</span>
+          <span class="fchip"><b>#14</b> priorities</span>
+        </div>
+        <div class="ship">Ships: <b>"max 5 Stripe steps concurrently" and "≤100 calls/min" enforced under a 1k-run flood.</b></div>
+      </div>
+    </div>
+
+    <!-- P7 -->
+    <div class="phase">
+      <div class="rail"><span class="num">7</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Failure handling</h3><span class="ptitle-note">// when things break for real</span></div>
+        <p class="goal">Runs that exhaust retries land in a dead-letter queue instead of vanishing; operators can manually retry from there; per-workflow policies decide fail-fast vs continue-on-error; and compensation steps unwind side effects (refund the charge if provisioning fails).</p>
+        <div class="feat">
+          <span class="fchip"><b>#26</b> dead-letter queue</span>
+          <span class="fchip"><b>#27</b> manual retry</span>
+          <span class="fchip"><b>#28</b> failure policies</span>
+          <span class="fchip"><b>#29</b> compensation / rollback</span>
+        </div>
+        <div class="ship">Ships: <b>a saga: charge → provision; provision fails → refund runs automatically.</b></div>
+      </div>
+    </div>
+
+    <!-- P8 -->
+    <div class="phase">
+      <div class="rail"><span class="num">8</span><span class="line"></span></div>
+      <div class="pbody">
+        <div class="ptop"><h3>Observability &amp; dashboard</h3><span class="ptitle-note">// see everything</span></div>
+        <p class="goal">The <code>history</code> table has been filling since Phase 1 — now surface it. A complete per-run timeline, structured logs, duration/queue/retry metrics, full error traces, live worker health, and queue-depth / throughput charts. Plus the UI to drive manual retry (#27) and cancellation (#11).</p>
+        <div class="feat">
+          <span class="fchip"><b>#30</b> execution history</span>
+          <span class="fchip"><b>#31</b> structured logs</span>
+          <span class="fchip"><b>#32</b> duration metrics</span>
+          <span class="fchip"><b>#33</b> errors + stack traces</span>
+          <span class="fchip"><b>#34</b> worker health</span>
+          <span class="fchip"><b>#35</b> queue depth / throughput</span>
+        </div>
+        <div class="ship">Ships: <b>a dashboard where you click a failed run, read its timeline + trace, and hit "Retry".</b></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="matrix">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">05</span><h2>All 35 features, mapped</h2></div>
+    <p class="sec-sub">Every requirement from your list, in build order, with the phase that delivers it. Nothing dropped.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>#</th><th>Feature</th><th>Group</th><th>Phase</th></tr></thead>
+        <tbody>
+          <tr><td class="id">1</td><td>Workflow definitions</td><td>Core</td><td><span class="ph">P1</span></td></tr>
+          <tr><td class="id">2</td><td>Durable step execution</td><td>Core</td><td><span class="ph">P1</span></td></tr>
+          <tr><td class="id">3</td><td>Crash recovery</td><td>Core</td><td><span class="ph">P1</span></td></tr>
+          <tr><td class="id">8</td><td>Idempotency</td><td>Core</td><td><span class="ph">P1</span></td></tr>
+          <tr><td class="id">5</td><td>Run queue (Postgres)</td><td>Core</td><td><span class="ph">P2</span></td></tr>
+          <tr><td class="id">6</td><td>Concurrent workers</td><td>Core</td><td><span class="ph">P2</span></td></tr>
+          <tr><td class="id">7</td><td>Leasing</td><td>Core</td><td><span class="ph">P2</span></td></tr>
+          <tr><td class="id">4</td><td>Automatic retries + backoff</td><td>Core</td><td><span class="ph">P2</span></td></tr>
+          <tr><td class="id">9</td><td>Sleep / delayed steps</td><td>Execution control</td><td><span class="ph">P3</span></td></tr>
+          <tr><td class="id">10</td><td>Step timeouts</td><td>Execution control</td><td><span class="ph">P3</span></td></tr>
+          <tr><td class="id">11</td><td>Cancellation</td><td>Execution control</td><td><span class="ph">P3</span></td></tr>
+          <tr><td class="id">19</td><td>Step dependencies / DAGs</td><td>Orchestration</td><td><span class="ph">P4</span></td></tr>
+          <tr><td class="id">15</td><td>Fan-out / parallel</td><td>Orchestration</td><td><span class="ph">P4</span></td></tr>
+          <tr><td class="id">16</td><td>Fan-in</td><td>Orchestration</td><td><span class="ph">P4</span></td></tr>
+          <tr><td class="id">17</td><td>Conditional branching</td><td>Orchestration</td><td><span class="ph">P4</span></td></tr>
+          <tr><td class="id">20</td><td>Child workflows</td><td>Orchestration</td><td><span class="ph">P4</span></td></tr>
+          <tr><td class="id">18</td><td>Wait-for-event / signals</td><td>Orchestration</td><td><span class="ph">P5</span></td></tr>
+          <tr><td class="id">21</td><td>API-triggered</td><td>Triggers</td><td><span class="ph">P5</span></td></tr>
+          <tr><td class="id">22</td><td>Event-triggered</td><td>Triggers</td><td><span class="ph">P5</span></td></tr>
+          <tr><td class="id">23</td><td>Cron / scheduled</td><td>Triggers</td><td><span class="ph">P5</span></td></tr>
+          <tr><td class="id">24</td><td>Delayed workflow starts</td><td>Triggers</td><td><span class="ph">P5</span></td></tr>
+          <tr><td class="id">25</td><td>Webhook ingestion</td><td>Triggers</td><td><span class="ph">P5</span></td></tr>
+          <tr><td class="id">12</td><td>Concurrency limits</td><td>Flow control</td><td><span class="ph">P6</span></td></tr>
+          <tr><td class="id">13</td><td>Rate limiting</td><td>Flow control</td><td><span class="ph">P6</span></td></tr>
+          <tr><td class="id">14</td><td>Priorities</td><td>Flow control</td><td><span class="ph">P6</span></td></tr>
+          <tr><td class="id">26</td><td>Dead-letter queue</td><td>Failure handling</td><td><span class="ph">P7</span></td></tr>
+          <tr><td class="id">27</td><td>Manual retry</td><td>Failure handling</td><td><span class="ph">P7</span></td></tr>
+          <tr><td class="id">28</td><td>Failure policies</td><td>Failure handling</td><td><span class="ph">P7</span></td></tr>
+          <tr><td class="id">29</td><td>Compensation / rollback</td><td>Failure handling</td><td><span class="ph">P7</span></td></tr>
+          <tr><td class="id">30</td><td>Execution history</td><td>Observability</td><td><span class="ph">P8</span></td></tr>
+          <tr><td class="id">31</td><td>Structured logs</td><td>Observability</td><td><span class="ph">P8</span></td></tr>
+          <tr><td class="id">32</td><td>Duration metrics</td><td>Observability</td><td><span class="ph">P8</span></td></tr>
+          <tr><td class="id">33</td><td>Error details + traces</td><td>Observability</td><td><span class="ph">P8</span></td></tr>
+          <tr><td class="id">34</td><td>Worker health</td><td>Observability</td><td><span class="ph">P8</span></td></tr>
+          <tr><td class="id">35</td><td>Queue depth / throughput</td><td>Observability</td><td><span class="ph">P8</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="tree">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">06</span><h2>Folder structure to grow into</h2></div>
+    <p class="sec-sub">A layout where each concern has one home, so Phase 6's rate limiter doesn't end up tangled in the executor. Since you're open to a clean pivot, adopt this before Phase 1.</p>
+    <pre>orqestra/
+├─ <span class="kw">src/</span>
+│  ├─ <span class="kw">define/</span>          <span class="c"># public API: defineWorkflow, step, sleep, waitForEvent</span>
+│  │   ├─ workflow.ts     <span class="c"># the builder → produces a DAG definition</span>
+│  │   └─ context.ts      <span class="c"># WorkflowContext handed to step fns</span>
+│  ├─ <span class="kw">engine/</span>          <span class="c"># the durable brain — no I/O framework here</span>
+│  │   ├─ executor.ts     <span class="c"># replay + advance a run one step</span>
+│  │   ├─ scheduler.ts    <span class="c"># which steps are ready (deps, run_after)</span>
+│  │   ├─ retry.ts        <span class="c"># backoff policy</span>
+│  │   └─ compensation.ts <span class="c"># rollback / saga unwind</span>
+│  ├─ <span class="kw">queue/</span>           <span class="c"># claim / lease / heartbeat</span>
+│  │   ├─ claim.ts        <span class="c"># the FOR UPDATE SKIP LOCKED query</span>
+│  │   └─ lease.ts
+│  ├─ <span class="kw">worker/</span>          <span class="c"># the long-running process loop</span>
+│  │   └─ worker.ts
+│  ├─ <span class="kw">store/</span>           <span class="c"># Postgres only — every query lives here</span>
+│  │   ├─ migrations/
+│  │   └─ repositories.ts
+│  ├─ <span class="kw">triggers/</span>        <span class="c"># api · cron · webhook · event</span>
+│  ├─ <span class="kw">control/</span>         <span class="c"># concurrency · rate-limit · priority (Redis optional)</span>
+│  ├─ <span class="kw">observability/</span>   <span class="c"># history, logger, metrics collectors</span>
+│  └─ <span class="kw">dashboard/</span>       <span class="c"># the UI + read API (Phase 8)</span>
+├─ <span class="kw">tests/</span>             <span class="c"># crash-recovery + concurrency tests are first-class</span>
+└─ <span class="kw">examples/</span>          <span class="c"># the saga, the fan-out, the sleeping workflow</span></pre>
+    <p style="color:var(--muted);font-size:14px;margin:0">Rule of thumb: <b>engine/</b> knows nothing about Postgres — it talks to <b>store/</b> through an interface. That keeps the correctness-critical logic unit-testable without a database, and leaves the door open to swap storage later.</p>
+  </div>
+</section>
+
+<section id="extras">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">07</span><h2>Worth stealing from the big engines</h2></div>
+    <p class="sec-sub">Not on your list, but each is cheap to fold in early and painful to retrofit. These are what separate a demo from something you'd actually run.</p>
+    <div class="enh">
+      <div class="card"><span class="badge">retrofit-hard</span><h3>Workflow versioning</h3><p>A run started on v1 must finish on v1's logic even after you deploy v2 — otherwise long-running or sleeping workflows break on every deploy. Pin the version at start; it's just a column, if you add it now.</p></div>
+      <div class="card"><span class="badge">correctness</span><h3>Deterministic replay guard</h3><p>Detect when replayed workflow code diverges from the recorded history (e.g. someone used <code>Date.now()</code> in a step) and fail loudly instead of corrupting state. Ship a <code>ctx.now()</code> / <code>ctx.random()</code> to make determinism the easy path.</p></div>
+      <div class="card"><span class="badge">ergonomics</span><h3>End-to-end typed steps</h3><p>Infer each step's result type so the next step's input is checked at compile time. It's the single biggest DX win over string-keyed context and it's basically free in TypeScript if designed in from Phase 1.</p></div>
+      <div class="card"><span class="badge">ops</span><h3>Namespaces / multi-tenancy</h3><p>A tenant/namespace column on runs from the start lets you isolate queues, quotas, and dashboards per team later — impossible to bolt on cleanly once data is mixed.</p></div>
+      <div class="card"><span class="badge">ops</span><h3>Batch / throttled fan-out</h3><p>Fan-out of 10k items shouldn't enqueue 10k rows at once. A batched map-step with a concurrency window pairs naturally with the Phase 6 limiter.</p></div>
+      <div class="card"><span class="badge">safety</span><h3>Poison-pill detection</h3><p>A step that crashes the worker process (not just throws) shouldn't infinitely reclaim-and-crash the pool. Count reclaim attempts on the lease and dead-letter after a ceiling.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="risks">
+  <div class="wrap">
+    <div class="sec-head"><span class="sec-num">08</span><h2>Where this gets hard</h2></div>
+    <p class="sec-sub">The traps that eat the most time. None are blockers — but knowing them now shapes the design so you don't hit them blind.</p>
+    <div class="risk"><span class="sev high">high</span><div class="rbody"><h4>Exactly-once side effects</h4><p>At-least-once delivery means a step can run twice (worker died after the side effect, before the commit). Design every external call around an idempotency key or a "did I already do this?" check — this is the hardest real-world property and it touches Phase 1 through 7.</p></div></div>
+    <div class="risk"><span class="sev high">high</span><div class="rbody"><h4>Replay determinism</h4><p>If workflow code branches on non-recorded, non-deterministic values, recovery replays a different path than the original run and state diverges. The replay guard and <code>ctx</code>-provided time/random are the fix — but only if they land before people write real workflows.</p></div></div>
+    <div class="risk"><span class="sev med">med</span><div class="rbody"><h4>Lease TTL tuning</h4><p>Too short and healthy long steps get reclaimed and double-run; too long and a crashed worker's job stalls. Answer: heartbeats that extend the lease while a step is genuinely alive, decoupling lease TTL from step duration.</p></div></div>
+    <div class="risk"><span class="sev med">med</span><div class="rbody"><h4>Queue fairness under priority</h4><p>Naive "priority DESC" starves normal runs when high-priority work floods in. Plan for aging or weighted fairness in Phase 6 rather than a raw sort.</p></div></div>
+    <div class="risk"><span class="sev med">med</span><div class="rbody"><h4>Timer precision without a hot loop</h4><p>Sleeps and cron shouldn't mean a tight polling loop hammering Postgres. Use a "next wake" query with a bounded poll interval, or a Redis/pg-notify nudge — decide the mechanism when you build Phase 3.</p></div></div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>orqestra · build plan · Bun + TypeScript + Postgres · 9 phases, 35 features + 6 enhancements. Build depth-first — one thin slice through every layer beats ten half-finished features.</p>
+  </div>
+</footer>
