@@ -1,2 +1,293 @@
 # orqestra
 
+A durable, crash-proof workflow engine built on Bun, TypeScript and Postgres.
+
+orqestra runs multi-step workflows that survive process crashes, retry themselves, sleep for
+days without holding a worker, and fan out across a pool of concurrent workers — the
+Temporal / Inngest idea, built lean enough to read in an afternoon.
+
+Postgres is the single source of truth. Every durable fact — run state, step results, queue
+rows, leases, timers — lives in Postgres and is mutated inside transactions. There is no
+separate broker, no control plane, and no vendor. A worker is a process you start.
+
+---
+
+## Why Postgres is the whole engine
+
+The design collapses into one table and one query. `step` is simultaneously the durable step
+log and the work queue, and every worker claims work with:
+
+```sql
+SELECT * FROM step
+WHERE status = 'ready' AND run_after <= now()
+  AND (lease_expires_at IS NULL OR lease_expires_at < now())
+ORDER BY priority DESC, run_after
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+```
+
+`FOR UPDATE SKIP LOCKED` is a correct, contention-free queue with no extra infrastructure.
+Transactions give exactly-once step commits for free: claim, run, persist result in one
+atomic unit. And crash recovery is just "read the rows" — state was never only in memory.
+
+Queueing, concurrent workers, leasing, priorities, sleep, and retry backoff are all
+predicates or columns on that one query rather than separate subsystems.
+
+---
+
+## Invariants
+
+Five properties hold from the first phase. Everything else is built on top of them.
+
+**Durable by default.** Nothing exists only in a worker's memory. A step is not "done" until
+its result is committed to Postgres in the same transaction that advances the run.
+
+**Determinism.** Workflow code is replayed on recovery. A completed step returns its
+recorded result rather than re-running. The function is a plan; the log is the truth.
+
+**Idempotency.** Every start carries an idempotency key and every step has a stable name.
+Duplicate triggers and duplicate side effects collapse to one committed outcome.
+
+**At-least-once delivery.** Workers can die mid-step, so a step can run more than once.
+Idempotency plus result memoization turn that into effectively exactly-once. Design external
+calls around an idempotency key.
+
+**Leases, not locks.** A worker claims work with an expiring lease. If it crashes, the lease
+expires and another worker reclaims the step. No job is ever permanently stuck behind a dead
+worker.
+
+---
+
+## Requirements
+
+- Bun 1.1+
+- Postgres 16 (a Docker Compose file is included)
+
+---
+
+## Getting started
+
+```bash
+bun install
+bun run db:up     # Postgres 16 on port 5433
+bun run migrate   # apply migrations; idempotent
+```
+
+Define a workflow as a DAG of named steps:
+
+```ts
+import { defineWorkflow } from 'orqestra'
+
+export const orderWorkflow = defineWorkflow('order-fulfillment', (wf) => {
+  wf.step('validateOrder', async (ctx) => {
+    const { itemCount } = ctx.input as { itemCount: number }
+    if (itemCount <= 0) throw new Error('order must have at least one item')
+    return { itemCount }
+  })
+
+  wf.step(
+    'chargePayment',
+    async (ctx) => {
+      const { itemCount } = ctx.input as { itemCount: number }
+      return { amount: itemCount * 25 }
+    },
+    { dependsOn: ['validateOrder'], maxAttempts: 3, timeoutMs: 10_000 }
+  )
+
+  wf.step('shipOrder', async () => ({ shipped: true }), {
+    dependsOn: ['chargePayment'],
+  })
+})
+```
+
+### Two run modes, on purpose
+
+**Inline** — executes the whole run in this process and resolves with its output. Intended
+for tests and local development.
+
+```ts
+import { orquestra, startRun } from 'orqestra'
+
+const orq = orquestra()
+const result = await startRun(orq.db, orderWorkflow, {
+  input: { itemCount: 3 },
+  idempotencyKey: 'order-1042',
+})
+console.log(result.status, result.output)
+```
+
+**Durable** — writes the run and its ready steps to the queue and returns immediately.
+Nothing executes on this call; workers pick the steps up.
+
+```ts
+import { orquestra, enqueueRun, createWorker } from 'orqestra'
+
+const orq = orquestra()
+
+const { runId } = await enqueueRun(orq.db, orderWorkflow, {
+  input: { itemCount: 3 },
+  idempotencyKey: 'order-1042',
+})
+
+const worker = createWorker({
+  db: orq.db,
+  handles: [orderWorkflow],
+  concurrency: 4,
+})
+worker.start()
+```
+
+Both modes share one workflow definition and one execution path. The difference is who
+drives the loop.
+
+---
+
+## Execution control
+
+### Sleep
+
+```ts
+await ctx.sleep('24h')
+```
+
+Sleeping does not block. `ctx.sleep` throws a control-flow signal the worker catches, writes
+the step back to the queue with a future `run_after`, and then goes looking for other work.
+No worker slot, no database connection, and not even the process is held for the duration —
+kill it and the step still wakes on schedule, because the wake time is a column.
+
+A sleeping step re-runs **from the top** when it wakes; there is no saved stack. The engine
+counts sleeps already served on the row, so an already-served `ctx.sleep` returns
+immediately instead of suspending again. Write step bodies so re-running the part before a
+sleep is harmless, and derive values that must survive a sleep from `ctx.input` rather than
+from `ctx.now()` or `ctx.random()`.
+
+Suspending is not failing: a sleep costs no retry attempt.
+
+### Timeouts
+
+```ts
+wf.step('callVendor', fn, { timeoutMs: 30_000 })
+```
+
+A step that exceeds its timeout is aborted and recorded as failed. It is an ordinary failure
+as far as retry and backoff are concerned — only the history label differs.
+
+### Cancellation
+
+```ts
+const result = await orq.cancel(runId)
+```
+
+Cancellation is cooperative. If no step is currently running, the run is finalized to
+`cancelled` immediately. If a step is in flight, the request is recorded and the worker that
+holds the lease observes it on its next heartbeat and finalizes at a safe point — stomping a
+running step from outside would race that worker's fenced commit and could produce two
+outcomes for one step. The returned `CancelResult` distinguishes the two cases.
+
+Steps receive `ctx.signal`, an `AbortSignal` fired on timeout or cancellation. Pass it to
+`fetch` and other child work so an abandoned step stops burning resources.
+
+### Retries
+
+Failures retry with exponential backoff up to the step's `maxAttempts` (default 1). Backoff
+is expressed as a future `run_after`, so a waiting retry occupies no worker.
+
+---
+
+## Configuration
+
+Configuration is read from the environment by `src/config.ts`, which fails fast with a clear
+error on malformed input.
+
+| Variable                 | Default                                              | Meaning                                        |
+| ------------------------ | ---------------------------------------------------- | ---------------------------------------------- |
+| `DATABASE_URL`           | `postgres://orqestra:orqestra@localhost:5433/orqestra` | Postgres connection string                   |
+| `ORQ_POOL_SIZE`          | `10`                                                 | Connection pool size                           |
+| `ORQ_LOG_LEVEL`          | `info`                                               | `debug` · `info` · `warn` · `error`            |
+| `ORQ_LEASE_TTL_MS`       | `30000`                                              | How long a claim holds before it is reclaimable |
+| `ORQ_POLL_INTERVAL_MS`   | `200`                                                | Worker sleep after finding the queue empty      |
+| `ORQ_WORKER_CONCURRENCY` | `1`                                                  | Max steps one worker runs at once               |
+
+Lease TTL is the tuning knob that matters: too short and healthy long steps get reclaimed
+and double-run; too long and a crashed worker's job stalls. In-flight steps heartbeat to
+extend their lease, which decouples the TTL from step duration.
+
+---
+
+## Architecture
+
+```
+src/
+  define/          public API — defineWorkflow, WorkflowContext
+  engine/          the durable brain — executor, scheduler, retry, sleep, timeout
+  queue/           claim (FOR UPDATE SKIP LOCKED) and lease
+  worker/          the long-running process loop
+  store/           Postgres only — every query lives here
+    migrations/    append-only numbered SQL
+    client.ts      the connection
+    repositories.ts typed query functions
+  control/         cancellation; concurrency, rate limits and priority later
+  triggers/        api · cron · webhook · event
+  observability/   structured logger, metrics
+  types.ts         core types + Result codec
+```
+
+**The boundary that keeps correctness testable:** `engine/` knows nothing about Postgres. It
+talks to storage only through typed functions in `store/repositories.ts`, and only
+`store/{client,migrate,repositories}.ts` may import the `postgres` package. Correctness-
+critical logic stays unit-testable without a database, and storage stays swappable.
+
+### The data model
+
+Eight tables carry the whole engine.
+
+| Table               | Purpose                                                  |
+| ------------------- | -------------------------------------------------------- |
+| `workflow`          | A registered definition and its version                   |
+| `run`               | One execution of a workflow                               |
+| `step`              | The queue and the durable step log, unified               |
+| `signal_wait`       | What a run is blocked on                                  |
+| `event`             | Events that have arrived                                  |
+| `history`           | Append-only observability spine                           |
+| `dead_letter`       | Runs that exhausted their retries                         |
+| `schema_migrations` | Which migrations have been applied                        |
+
+Several choices are cheap now and painful to retrofit, so they are in from the start:
+`workflow.version`, so a run started on v1 finishes on v1's logic even after v2 deploys;
+`run.namespace`, for per-tenant isolation of queues and quotas; statuses as `text` with
+`CHECK` constraints rather than native enums, so new values need no `ALTER TYPE`; and
+`jsonb` for every column whose shape varies.
+
+---
+
+## Examples
+
+Runnable against a local Postgres:
+
+```bash
+bun run examples/durable.ts            # a DAG that fans out and back in
+bun run examples/workers.ts            # 3 workers draining one queue, with a retry
+bun run examples/sleeping-workflow.ts  # a step that sleeps and releases its worker
+```
+
+---
+
+## Development
+
+```bash
+bun run db:up                        # start Postgres
+bun run migrate                      # apply migrations
+bun test                             # full suite against a real database
+bun test tests/crash-recovery.test.ts # a single file
+bunx tsc --noEmit                    # strict typecheck; zero errors is the bar
+bun run db:down                      # stop Postgres
+```
+
+Crash-recovery and concurrency tests are first-class: the suite kills real worker processes
+mid-step and asserts that leases are reclaimed and completed steps are never re-run.
+
+---
+
+## Status
+
+orqestra is under active development and the public API is not stable.
