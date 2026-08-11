@@ -442,13 +442,21 @@ export async function getDependencySteps(sql: Db, stepId: string): Promise<StepR
 // function doesn't judge why, it just tracks which names have resolved and
 // releases the step the instant every name in `depends_on` is among them.
 //
-// Single statement, so the whole read-append-maybe-release sequence is one
-// row-level lock acquired and released by Postgres itself — no
-// application-level read-then-write, hence no window for two concurrent
-// callers to both observe "not yet satisfied" and neither one flip the
-// step to `ready` (the fan-in bug this exists to rule out), and no
-// deadlock (each call only ever touches the one row it's updating, and
-// only for the lifetime of this one statement).
+// One UPDATE statement, not a chain of two CTEs writing the same table:
+// Postgres data-modifying CTEs all execute against the snapshot taken at
+// the start of the command, so a second CTE cannot see a first CTE's
+// write to the very same row within one statement (empirically: it
+// matches zero rows, silently, rather than erroring — this was caught by
+// this file's own tests, not by the docs). Computing the new
+// `satisfied_deps` once via a scalar subquery and reusing it for both the
+// SET and the readiness CASE keeps this a single write to a single row,
+// which is exactly what makes it race-safe: the whole
+// read-append-maybe-release sequence is one row-level lock acquired and
+// released by Postgres itself, no application-level read-then-write, so
+// there is no window for two concurrent callers to both observe "not yet
+// satisfied" and neither one flip the step to `ready` (the fan-in bug this
+// exists to rule out), and no deadlock (each call only ever touches the
+// one row it's updating, for the lifetime of this one statement).
 //
 // Returns the step's current row whether or not this call was the one that
 // released it — check `.status === 'ready'` to tell those apart. Returns
@@ -462,25 +470,20 @@ export async function recordDependencySatisfied(
   depName: string
 ): Promise<StepRow | undefined> {
   const rows = await sql<StepRow[]>`
-    with appended as (
-      update step
-      set satisfied_deps = (
-            select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
-          ),
-          updated_at = now()
-      where id = ${stepId} and status = 'pending'
-      returning *
-    ),
-    released as (
-      update step s
-      set status = 'ready', updated_at = now()
-      from appended a
-      where s.id = a.id and a.depends_on <@ a.satisfied_deps
-      returning s.*
-    )
-    select * from released
-    union all
-    select * from appended where id not in (select id from released)
+    update step
+    set
+      satisfied_deps = (
+        select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+      ),
+      status = case
+        when depends_on <@ (
+          select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+        ) then 'ready'
+        else status
+      end,
+      updated_at = now()
+    where id = ${stepId} and status = 'pending'
+    returning *
   `
   return rows[0]
 }
