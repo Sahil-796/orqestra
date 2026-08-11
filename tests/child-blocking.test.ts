@@ -141,7 +141,10 @@ describe('the block itself', () => {
     const events = await history(runId)
     expect(events.filter((e) => e.type === 'step.blocked')).toHaveLength(1)
     expect(events.filter((e) => e.type === 'step.sleeping')).toHaveLength(0)
-    expect((await step(runId, 'spawn')).attempt).toBe(2)
+    // ...but only one attempt is spent: blocking gives back the attempt the
+    // claim consumed, exactly as sleeping does, so awaiting a child never
+    // eats into the step's retry budget.
+    expect((await step(runId, 'spawn')).attempt).toBe(1)
     // The link is cleared on resolution, not left dangling.
     expect((await step(runId, 'spawn')).awaited_child_run_id).toBeNull()
   }, 30_000)

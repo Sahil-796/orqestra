@@ -19,6 +19,7 @@ import {
   getRun,
   isCancellationRequested,
   requestRunCancellation,
+  resolveBlockedStepForChildRun,
   type RunRow,
 } from '../store/repositories.ts'
 
@@ -80,6 +81,10 @@ export async function cancelRun(db: Db, runId: string): Promise<CancelResult> {
     // already cancelled, so report it rather than inventing a failure.
     return { requested, finalized: false, pending: false, run: await getRun(db, runId) }
   }
+  // Cancelled is terminal, so a parent step blocked on this run as its child
+  // has to be woken here too — same reason the worker's cancellation commit
+  // wakes it. Missing this leaves the parent blocked until the sweep.
+  await resolveBlockedStepForChildRun(db, runId)
   return { requested, finalized: true, pending: false, run }
 }
 
@@ -103,7 +108,9 @@ export async function sweepCancelledRuns(db: Db): Promise<string[]> {
   for (const candidate of pending) {
     if (await hasRunningStep(db, candidate.id)) continue
     const { run } = await finalizeCancelledRun(db, candidate.id)
-    if (run) finalized.push(run.id)
+    if (!run) continue
+    await resolveBlockedStepForChildRun(db, run.id)
+    finalized.push(run.id)
   }
 
   return finalized

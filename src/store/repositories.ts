@@ -260,7 +260,12 @@ export async function getChildRuns(sql: Db, parentRunId: string): Promise<RunRow
 // exactly like `sleepStep` (0003) does for a sleep — same fencing (only the
 // current lease holder may do this), same "give the worker back" shape, so
 // a long-running child (which may itself sleep, retry, or fan out) never
-// pins a worker slot for its whole lifetime.
+// pins a worker slot for its whole lifetime. The attempt decrement is
+// `sleepStep`'s reasoning verbatim: claiming the step consumed an attempt,
+// but suspending to await a child is not a failed try, so give it back —
+// otherwise a step that awaits N children in sequence silently burns N of
+// its `max_attempts` budget and dies of retry exhaustion without ever
+// having thrown.
 export async function blockStepOnChildRun(
   sql: Db,
   args: { stepId: string; workerId: string; childRunId: string }
@@ -269,6 +274,7 @@ export async function blockStepOnChildRun(
     update step set
       status = 'blocked',
       awaited_child_run_id = ${args.childRunId},
+      attempt = greatest(attempt - 1, 0),
       lease_owner = null,
       lease_expires_at = null,
       updated_at = now()
