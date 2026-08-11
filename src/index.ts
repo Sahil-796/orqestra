@@ -18,6 +18,30 @@ export type { StartRunOptions, RunResult, EnqueueRunResult, AdvanceResult } from
 export { SleepSignal, isSleepSignal, parseDuration } from './engine/sleep.ts'
 export { StepTimeoutError, isStepTimeoutError, withTimeout } from './engine/timeout.ts'
 
+// Phase 4 #20: child workflows. See src/control/child.ts's module doc for
+// the propagation policy and the honest limits of what's wired (child-await
+// is built on ctx.sleep, not the dedicated 'blocked' step status — that
+// needs a worker.ts hook outside this unit's scope).
+export {
+  ChildWorkflowError,
+  isChildWorkflowError,
+  classifyChildRun,
+  isTerminalRunStatus,
+  type ChildOutcome,
+} from './engine/child.ts'
+export {
+  spawnChildRun,
+  getChildOutcome,
+  awaitChildRun,
+  runChildWorkflow,
+  runChildWorkflowResult,
+  type SpawnChildOptions,
+  type SpawnChildResult,
+  type AwaitChildOptions,
+  type ChildRunResult,
+} from './control/child.ts'
+export { nextChildCallSeq } from './define/context.ts'
+
 export { createWorker } from './worker/worker.ts'
 export type { Worker, WorkerOptions } from './worker/worker.ts'
 
