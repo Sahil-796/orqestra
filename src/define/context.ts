@@ -45,6 +45,28 @@ export function getSkipRequests(ctx: WorkflowContext): readonly string[] {
   return skipRequestsByContext.get(ctx) ?? []
 }
 
+// Per-context (i.e. per-execution) call counter, mirroring `sleep`'s own
+// internal `sleepCalls` and `skipRequestsByContext`'s WeakMap-per-ctx
+// pattern. Phase 4's control/child.ts uses this to build a stable,
+// replay-safe default key for `spawnChildRun` when the step author doesn't
+// supply one: since `ctx` is rebuilt fresh on every execution and a step
+// function's code path up to a given call site is assumed deterministic
+// (the same assumption `sleep_seq` already relies on), calling this at the
+// same point in a step's control flow yields the same sequence number on
+// every replay.
+const childCallSeqByContext = new WeakMap<WorkflowContext, { value: number }>()
+
+/** Next 1-based call index for `ctx`, starting at 1. See the note above. */
+export function nextChildCallSeq(ctx: WorkflowContext): number {
+  let counter = childCallSeqByContext.get(ctx)
+  if (!counter) {
+    counter = { value: 0 }
+    childCallSeqByContext.set(ctx, counter)
+  }
+  counter.value += 1
+  return counter.value
+}
+
 export interface WorkflowContext {
   /** The run's input, as passed to enqueue/run. */
   readonly input: unknown
