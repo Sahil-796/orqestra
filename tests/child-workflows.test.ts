@@ -164,12 +164,19 @@ describe('runChildWorkflow: end-to-end', () => {
     })
     worker.start()
 
-    // Give the parent time to spawn the child and hit its first poll sleep,
-    // but well before the child's own 400ms sleep is due.
-    await new Promise((resolve) => setTimeout(resolve, 180))
+    // Wait for the parent to actually suspend rather than sleeping a fixed
+    // guess at how long that takes: how quickly a worker gets around to
+    // claiming the step is a property of the machine, not of the feature,
+    // and a fixed window turns a slow laptop into a red test. The assertions
+    // below still only hold if the suspension is real — the child must still
+    // be in flight when we look, which is checked explicitly.
+    const deadline = Date.now() + 10_000
+    let spawnStep = (await getStepsByRun(sql, runId)).find((s) => s.name === 'spawn')
+    while (spawnStep?.status !== 'blocked' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      spawnStep = (await getStepsByRun(sql, runId)).find((s) => s.name === 'spawn')
+    }
 
-    const parentSteps = await getStepsByRun(sql, runId)
-    const spawnStep = parentSteps.find((s) => s.name === 'spawn')
     expect(spawnStep).toBeDefined()
     // Not `running`: no worker holds this step's lease mid-wait.
     expect(spawnStep?.status).toBe('blocked')
@@ -178,6 +185,10 @@ describe('runChildWorkflow: end-to-end', () => {
     // And it says what it's waiting on, rather than a wake time.
     const children = await getChildRuns(sql, runId)
     expect(spawnStep?.awaited_child_run_id).toBe(children[0]!.id)
+    // The child is genuinely still in flight at this point, so what we just
+    // observed is a parent released mid-wait — not one that had already been
+    // woken by a child that finished while we waited to look.
+    expect(['queued', 'running']).toContain(children[0]!.status)
 
     const run = await drain(runId, [worker])
     expect(run.status).toBe('completed')
