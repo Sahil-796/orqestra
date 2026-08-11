@@ -71,10 +71,12 @@ import type { Db } from '../store/client.ts'
 import {
   countStepsByStatus,
   getDependencySteps,
+  getIncompleteRuns,
   getStepsByRun,
   insertHistory,
   lockRun,
   recordDependencySatisfied,
+  resolveBlockedStepForChildRun,
   skipStep,
   updateRunStatus,
   type RunRow,
@@ -206,7 +208,67 @@ export async function maybeFinalizeRun(sql: Db, runId: string): Promise<RunRow |
 
   const run = await updateRunStatus(sql, runId, 'completed', { output, finishedAt: new Date() })
   await insertHistory(sql, { runId, type: 'run.completed', data: { output } })
+  await wakeParentAwaiting(sql, runId)
   return run
+}
+
+/**
+ * Feature #20's wake side: this run just reached a terminal status, so a
+ * step in some OTHER run that is `blocked` on it (control/child.ts) must go
+ * back to `ready`. A no-op — one index-backed UPDATE matching nothing — for
+ * the overwhelming majority of runs, which nobody is awaiting.
+ *
+ * **Call this from inside the transaction that wrote the terminal status,
+ * or strictly after that transaction committed — never before.** That is
+ * what closes the race against a parent step blocking at the same instant:
+ * `worker.ts`'s `commitChildBlock` holds `FOR UPDATE` on this run's row
+ * while it writes `'blocked'`, so it and the finalizer are serialized on
+ * that row, and whichever goes second sees the other's work.
+ *
+ * Deliberately writes no history row: a history insert takes an implicit
+ * FK lock on the *parent's* run row, and the finalizer already holds this
+ * (the child's) row — acquiring the two in that order here, while
+ * `commitChildBlock` acquires them the other way round, is a textbook
+ * deadlock. The wake is legible from the step row itself
+ * (`awaited_child_run_id` cleared, `status` back to `ready`).
+ */
+export async function wakeParentAwaiting(sql: Db, childRunId: string): Promise<StepRow | undefined> {
+  return resolveBlockedStepForChildRun(sql, childRunId)
+}
+
+/**
+ * Reconciliation net for `blocked` steps, meant to be called on a timer
+ * (worker.ts runs it on the same tick as the reclaim sweep). Everything
+ * that finalizes a run is supposed to call `wakeParentAwaiting` itself, and
+ * the paths this repo owns do — but "supposed to" is not a guarantee across
+ * every present and future finalization site, and the failure mode of a
+ * missed wake is the worst one this phase has: a parent blocked forever on
+ * a child that is already done.
+ *
+ * So this sweeps the other direction, from the awaiting side: for every run
+ * still in flight, re-offer each of its `blocked` steps to
+ * `resolveBlockedStepForChildRun`, whose `exists (... status in
+ * ('completed','failed','cancelled'))` guard makes the call a no-op unless
+ * the child really is terminal. It therefore never wakes a step early, and
+ * never wakes one twice — which is exactly why running it on a timer does
+ * NOT reintroduce polling: a step still blocked on a running child is left
+ * untouched, and costs one row read.
+ *
+ * Cost is O(in-flight runs) reads per tick. Returns the ids of the steps it
+ * actually woke, which should normally be zero — a non-empty result means
+ * some finalization path skipped its inline wake.
+ */
+export async function sweepBlockedChildAwaits(sql: Db): Promise<string[]> {
+  const woken: string[] = []
+  for (const run of await getIncompleteRuns(sql)) {
+    const steps = await getStepsByRun(sql, run.id)
+    for (const step of steps) {
+      if (step.status !== 'blocked' || step.awaited_child_run_id === null) continue
+      const resolved = await resolveBlockedStepForChildRun(sql, step.awaited_child_run_id)
+      if (resolved) woken.push(resolved.id)
+    }
+  }
+  return woken
 }
 
 /**
