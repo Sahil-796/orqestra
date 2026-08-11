@@ -48,6 +48,48 @@ export function isChildWorkflowError(value: unknown): value is ChildWorkflowErro
   return value instanceof ChildWorkflowError
 }
 
+const CHILD_BLOCK_BRAND = '__orqestraChildBlockSignal'
+
+/**
+ * Thrown by `awaitChildRun` (control/child.ts) to suspend the parent step on
+ * a child run that hasn't reached a terminal status yet. Exactly the same
+ * kind of object as `SleepSignal`: control flow, not a failure. The worker
+ * catches it, commits `blockStepOnChildRun` (fenced on the lease, the way
+ * `commitSleep` commits `sleepStep`), and gives the worker slot back. The
+ * step is woken by `resolveBlockedStepForChildRun` when the child actually
+ * reaches a terminal state — not by a clock — and then replays from the top,
+ * where `getChildOutcome` now returns and the signal is never thrown again.
+ *
+ * That self-resolving property is why this signal needs no `seq` counter:
+ * `sleep_seq` exists because a woken sleep would otherwise re-suspend on the
+ * same `ctx.sleep()` call forever, whereas a woken child-await re-checks the
+ * child's status first, and the only thing that could have woken it is that
+ * status becoming terminal.
+ */
+export class ChildBlockSignal extends Error {
+  /** Brand, not `instanceof` — see isChildBlockSignal for why. */
+  readonly [CHILD_BLOCK_BRAND] = true as const
+  readonly childRunId: string
+
+  constructor(childRunId: string) {
+    super(`orqestra: step is blocked on child run ${childRunId}`)
+    this.name = 'ChildBlockSignal'
+    this.childRunId = childRunId
+  }
+}
+
+/**
+ * Brand check rather than `instanceof`, same reasoning as `isSleepSignal`:
+ * a module loaded through two different specifiers produces two distinct
+ * classes. Misclassifying a block as a step failure would burn an attempt
+ * and could fail the run.
+ */
+export function isChildBlockSignal(value: unknown): value is ChildBlockSignal {
+  if (typeof value !== 'object' || value === null) return false
+  if ((value as Record<string, unknown>)[CHILD_BLOCK_BRAND] === true) return true
+  return value instanceof ChildBlockSignal
+}
+
 const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ['completed', 'failed', 'cancelled']
 
 export function isTerminalRunStatus(status: RunStatus): boolean {

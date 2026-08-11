@@ -67,6 +67,21 @@ export function nextChildCallSeq(ctx: WorkflowContext): number {
   return counter.value
 }
 
+// The id of the step row this context was built for, kept off the public
+// `WorkflowContext` shape (same WeakMap-per-ctx trick as `getSkipRequests`
+// and `nextChildCallSeq`) so adding it doesn't change the object step
+// authors see. Phase 4 #20 uses it for one thing only: recording
+// `run.parent_step_id` on a spawned child, so "which step is awaiting this
+// child" is answerable from the child row alone. The *blocking* side needs
+// nothing from here — the worker already owns `step.id`/`workerId` at the
+// moment it commits the block.
+const stepIdByContext = new WeakMap<WorkflowContext, string>()
+
+/** The step id this context belongs to, if the caller supplied one. */
+export function getContextStepId(ctx: WorkflowContext): string | undefined {
+  return stepIdByContext.get(ctx)
+}
+
 export interface WorkflowContext {
   /** The run's input, as passed to enqueue/run. */
   readonly input: unknown
@@ -146,6 +161,8 @@ export function createWorkflowContext(input: {
   sleepSeq?: number
   /** Aborted on step timeout or run cancellation. Default: a never-aborted signal. */
   signal?: AbortSignal
+  /** The step row this context runs for. Read back via `getContextStepId`. */
+  stepId?: string
 }): WorkflowContext {
   const alreadyServed = input.sleepSeq ?? 0
   // Per-context (i.e. per-execution) counter of ctx.sleep() calls made so far.
@@ -179,5 +196,6 @@ export function createWorkflowContext(input: {
   }
 
   skipRequestsByContext.set(ctx, skipRequests)
+  if (input.stepId !== undefined) stepIdByContext.set(ctx, input.stepId)
   return ctx
 }

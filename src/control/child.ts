@@ -13,40 +13,51 @@
 // where `db` is whatever `Db` the surrounding application already has in
 // scope (the same one passed to `createWorker`).
 //
-// *** Design note — read this before wiring the 'blocked' step status ***
+// *** How the wait works: event-driven, not polled ***
 //
-// Unit A's storage layer (0004_orchestration.sql) built a dedicated
-// `'blocked'` step status plus `awaited_child_run_id`, `blockStepOnChildRun`,
-// and `resolveBlockedStepForChildRun`, deliberately mirroring Phase 3's
-// `sleepStep` exactly: `blockStepOnChildRun` is fenced on
-// `status = 'running' AND lease_owner = workerId`, the same way `sleepStep`
-// is. Using it for real needs the step's own `stepId` and the *worker's*
-// `workerId` at the exact moment the step suspends — and those two values
-// only exist inside src/worker/worker.ts's `runClaimedStep` closure, which
-// is the sole call site that builds a `WorkflowContext` (via
-// `createWorkflowContext`). That call site does not pass `stepId`/
-// `workerId` into the context today, and recognizing a new "spawn blocked
-// on a child" signal in its Attempt classification switch (a
-// `commitChildBlock` mirroring `commitSleep`) is what would actually call
-// `blockStepOnChildRun` with proper fencing. `src/worker/worker.ts` is
-// outside this unit's file allowlist, so that hook is NOT wired — see the
-// Phase 4 report for the precise, minimal change it would take.
+// A parent step awaiting a child suspends EXACTLY ONCE and is woken by the
+// child's terminal transition — there is no timer and no poll interval in
+// this path at all. The three moving parts:
 //
-// Rather than reach into that file, child-await here is built entirely out
-// of the ALREADY fully-wired `ctx.sleep()` primitive (Phase 3): spawn the
-// child once — idempotently, see `spawnChildRun` — then poll
-// `getChildOutcome` on a sleep backoff until the child reaches a terminal
-// status. Every property this feature has to prove is already true of
-// `ctx.sleep()`/`sleepStep`: the parent's lease is genuinely released while
-// the child runs (sleepStep clears `lease_owner`/`lease_expires_at`), a
-// sleeping step's `run_after` survives the spawning process dying (it's a
-// row, not a timer — Phase 3 doc §1), and sleeping costs no retry attempt
-// (`sleepStep`'s `attempt = greatest(attempt - 1, 0)`). This file adds zero
-// new crash-proofing machinery; it composes an already-proven one. The
-// `'blocked'` status / `awaited_child_run_id` column are consequently not
-// exercised by this implementation — a parent awaiting a child currently
-// shows up as an ordinary sleeping step, not a distinctly-labelled
-// "blocked" one.
+//   1. `awaitChildRun` reads the child's outcome once. If the child is not
+//      terminal yet it throws a `ChildBlockSignal` (engine/child.ts) — the
+//      same species of control-flow signal as Phase 3's `SleepSignal`, and
+//      handled the same way.
+//   2. src/worker/worker.ts classifies that signal in its Attempt switch and
+//      calls `commitChildBlock`, which persists `blockStepOnChildRun` —
+//      status `'blocked'`, `awaited_child_run_id` set, lease cleared —
+//      fenced on `lease_owner` inside the transaction, exactly as
+//      `commitSleep` fences `sleepStep`. The worker slot is given back; a
+//      `blocked` step is invisible to `claimNextStep` (it only looks at
+//      `ready`) and to the lease reaper (`findExpiredLeases` only looks at
+//      `running`), so nothing can resurrect it early.
+//   3. Every path that drives a run to a terminal status calls
+//      `resolveBlockedStepForChildRun(sql, childRunId)` — engine/dag.ts's
+//      `maybeFinalizeRun`, the worker's failure and cancellation commits,
+//      the inline executor's finalize/fail paths, plus a reconciliation
+//      sweep (`sweepBlockedChildAwaits`) the worker runs on the same tick as
+//      the reclaim sweep. That flips the parent step back to `ready`, and
+//      the next worker to claim it replays the step function from the top,
+//      where `getChildOutcome` now returns and the signal is never thrown
+//      again. Resolution is a property of the child run's row, not of the
+//      process that spawned it: whichever worker finishes the child wakes
+//      the parent, even if the spawning process is long dead.
+//
+// The ordering race — "the child finishes between step 1's read and step 2's
+// write, so the resolver looks for a `blocked` step that isn't there yet" —
+// is closed with a lock, not a retry: `commitChildBlock` takes `FOR UPDATE`
+// on the CHILD run row before it writes, and every resolver runs its
+// `resolveBlockedStepForChildRun` in the same transaction that flipped the
+// child run's status (i.e. while holding that same row lock) or strictly
+// after it committed. So the two are serialized: either the block lands
+// first and the finalizer sees it, or the finalizer lands first and the
+// block transaction re-reads the now-terminal status and un-blocks itself
+// in place before committing.
+//
+// Note the inline driver (engine/executor.ts's `startRun`/`executeRun`) does
+// not support child workflows, the same way it does not support `ctx.sleep`:
+// it is single-process and sequential, so nothing would ever run the child.
+// A `ChildBlockSignal` there is treated as an ordinary step failure.
 
 import { withTransaction, type Db } from '../store/client.ts'
 import {
@@ -58,9 +69,10 @@ import {
   type NewStep,
 } from '../store/repositories.ts'
 import type { WorkflowContext } from '../define/context.ts'
-import { nextChildCallSeq } from '../define/context.ts'
+import { getContextStepId, nextChildCallSeq } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import {
+  ChildBlockSignal,
   classifyChildRun,
   isTerminalRunStatus,
   toChildWorkflowError,
@@ -74,8 +86,8 @@ export interface SpawnChildOptions {
   priority?: number
   /**
    * Distinguishes multiple children spawned by the same parent step, so a
-   * replay (the step function re-running from the top after each poll
-   * wakes it) spawns each child at most once. Defaults to an
+   * replay (the step function re-running from the top once the child it was
+   * blocked on resolves) spawns each child at most once. Defaults to an
    * auto-incrementing per-context counter (`nextChildCallSeq`) keyed on
    * call order — supply your own explicit key when a step's children
    * aren't spawned in a fixed order across attempts (e.g. inside a loop
@@ -99,8 +111,8 @@ export interface SpawnChildResult {
  *
  * The idempotency key is derived from the parent run + a caller/auto
  * -assigned `key`, not used as a Phase 1 #8 business idempotency key — its
- * only job is making sure a step that re-runs after waking from a poll
- * sleep doesn't spawn a second child.
+ * only job is making sure a step that re-runs after being woken from a
+ * child block doesn't spawn a second child.
  */
 export async function spawnChildRun(
   db: Db,
@@ -116,7 +128,7 @@ export async function spawnChildRun(
   // (claimStep/queue/claim.ts filters on it), and a child that landed in
   // 'default' while its parent's pool watches some other namespace would
   // spawn a row nothing in that pool ever claims — the parent would then
-  // poll-sleep forever waiting on a child no worker can see. Only look this
+  // block forever waiting on a child no worker can see. Only look this
   // up when the caller didn't already pick a namespace.
   const namespace = options.namespace ?? (await getRun(db, parentCtx.runId))?.namespace
 
@@ -128,6 +140,10 @@ export async function spawnChildRun(
     input: options.input,
     idempotencyKey,
     parentRunId: parentCtx.runId,
+    // Undefined outside a worker (the context carries it only when
+    // worker.ts built it), which is exactly when there is no step row to
+    // point at anyway — the column stays null, as it did before.
+    parentStepId: getContextStepId(parentCtx),
   })
 
   if (!created) return { runId: run.id, created: false }
@@ -155,8 +171,9 @@ export async function spawnChildRun(
 
 /**
  * Read a child run's outcome. Returns `undefined` while it's still in
- * flight — nothing here blocks; callers poll this (see `awaitChildRun`)
- * rather than holding a connection open waiting.
+ * flight — nothing here blocks or waits; `awaitChildRun` calls this once
+ * per execution of the parent step and suspends the step if it's still
+ * undefined, rather than holding a connection open waiting.
  */
 export async function getChildOutcome(db: Db, childRunId: string): Promise<ChildOutcome | undefined> {
   const run = await getRun(db, childRunId)
@@ -178,44 +195,42 @@ export async function getChildOutcome(db: Db, childRunId: string): Promise<Child
 }
 
 export interface AwaitChildOptions {
-  /** Backoff between polls while the child is still in flight. Default 1s. */
+  /**
+   * @deprecated Accepted and ignored. The wait is event-driven — the parent
+   * step suspends once and is woken by the child's terminal transition, so
+   * there is no poll interval to tune. Kept on the type so callers written
+   * against the original polling implementation still compile.
+   */
   pollIntervalMs?: number
 }
 
 /**
  * Wait for a child run to reach a terminal outcome, releasing the parent
- * step's lease between checks via `ctx.sleep` (see this file's module doc
- * for why that, and not the dedicated `'blocked'` status, is the
- * suspension mechanism used here). This loop is what makes the wait
- * crash-proof: on every replay it re-checks the outcome BEFORE sleeping
- * again, so a child that finished while the parent process was dead (or
- * simply between polls) is observed on the very next claim, by whichever
- * worker picks the row up — nothing about resolution depends on the
- * process that called `spawnChildRun` still being alive.
+ * step's worker while it waits.
  *
- * Each loop iteration that finds the child still in flight calls
- * `ctx.sleep(pollIntervalMs)` — a NEW sleep call, distinct from whichever
- * ones this step already served (Phase 3's `sleep_seq` replay contract),
- * so it only ever actually suspends once per execution: every previously
- * -served sleep in this loop resolves in place near-instantly on replay,
- * and the loop keeps checking the outcome each time before deciding
- * whether it needs to ask for a new one.
+ * There is no loop and no timer: read the outcome once, and if the child is
+ * still in flight throw a `ChildBlockSignal`, which the worker turns into a
+ * fenced `blockStepOnChildRun` commit (see this file's module doc for the
+ * full path and the race analysis). The step is re-claimed only after the
+ * child actually reaches a terminal status, at which point this same call
+ * returns instead of throwing — so on the resumed execution the step
+ * function replays straight through to the outcome.
+ *
+ * Crash-proofing comes from the same place `ctx.sleep`'s does: the parent's
+ * state is a row (`status = 'blocked'`, `awaited_child_run_id`), not a timer
+ * or a held connection, and the wake is written by whichever worker finishes
+ * the child. Nothing about resolution depends on the process that called
+ * `spawnChildRun` still being alive.
  */
 export async function awaitChildRun(
   db: Db,
   ctx: WorkflowContext,
   childRunId: string,
-  options: AwaitChildOptions = {}
+  _options: AwaitChildOptions = {}
 ): Promise<ChildOutcome> {
-  const pollIntervalMs = options.pollIntervalMs ?? 1_000
-  while (true) {
-    const outcome = await getChildOutcome(db, childRunId)
-    if (outcome) return outcome
-    // Throws (suspends) unless this poll's sequence number was already
-    // served on a prior execution of this step, in which case it resolves
-    // immediately and the loop re-checks the outcome before asking again.
-    await ctx.sleep(pollIntervalMs)
-  }
+  const outcome = await getChildOutcome(db, childRunId)
+  if (outcome) return outcome
+  throw new ChildBlockSignal(childRunId)
 }
 
 /** `runChildWorkflowResult`'s return shape — never throws on child failure. */
