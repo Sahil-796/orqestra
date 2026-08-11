@@ -4,13 +4,17 @@
 // Phase 2/3's worker tests hold.
 //
 // Design note (see src/control/child.ts's module doc for the long version):
-// this implementation suspends the parent step via `ctx.sleep()` backoff
-// polling, NOT the dedicated `'blocked'` step status Unit A's storage layer
-// added — wiring that needs a src/worker/worker.ts hook this unit's
-// allowlist doesn't cover. The tests below still prove every property that
-// matters: the parent's lease is genuinely released while the child runs,
-// resumption survives the spawning worker never coming back, and a
-// failed/cancelled child propagates per the stated policy.
+// the parent step suspends into the dedicated `'blocked'` status with
+// `awaited_child_run_id` set, and is woken by the child run's terminal
+// transition — no polling, no timer. The properties proved here are
+// unchanged from the original polling implementation: the parent's lease is
+// genuinely released while the child runs, resumption survives the spawning
+// worker never coming back, and a failed/cancelled child propagates per the
+// stated policy. tests/child-blocking.test.ts covers the block mechanism
+// itself (suspends exactly once, wakes on the child's terminal write).
+//
+// `pollIntervalMs` still appears below purely to keep proving that the old
+// option is accepted and ignored rather than being a compile error.
 
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test'
 import { createDb } from '../src/store/client.ts'
@@ -168,11 +172,12 @@ describe('runChildWorkflow: end-to-end', () => {
     const spawnStep = parentSteps.find((s) => s.name === 'spawn')
     expect(spawnStep).toBeDefined()
     // Not `running`: no worker holds this step's lease mid-wait.
-    expect(spawnStep?.status).toBe('ready')
+    expect(spawnStep?.status).toBe('blocked')
     expect(spawnStep?.lease_owner).toBeNull()
     expect(spawnStep?.lease_expires_at).toBeNull()
-    // It's due again in the future, not immediately claimable right now.
-    expect(spawnStep!.run_after.getTime()).toBeGreaterThan(Date.now() - 50)
+    // And it says what it's waiting on, rather than a wake time.
+    const children = await getChildRuns(sql, runId)
+    expect(spawnStep?.awaited_child_run_id).toBe(children[0]!.id)
 
     const run = await drain(runId, [worker])
     expect(run.status).toBe('completed')
