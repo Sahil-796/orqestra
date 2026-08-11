@@ -725,12 +725,22 @@ export async function retryStep(
 // Called when a run is being failed/cancelled so its remaining unclaimed
 // steps stop being claimable — otherwise a worker could pick one up after
 // the run is already decided, doing wasted (or worse, order-dependent)
-// work on a run that's over. Only pending/ready are touched; running steps
-// are left for their worker (or the reclaim sweep) to resolve on its own.
+// work on a run that's over. Only pending/ready/blocked are touched;
+// running steps are left for their worker (or the reclaim sweep) to resolve
+// on its own.
+//
+// `blocked` (Phase 4 #20) has to be in that list for the same reason
+// `pending` is, and it is easy to miss because a blocked step looks inert:
+// nobody holds its lease, so it reads like a step that has already stopped.
+// It hasn't. It is still waiting on a child run, and when that child reaches
+// a terminal status `resolveBlockedStepForChildRun` flips it back to
+// `ready` — which, if the parent run was cancelled in the meantime, means
+// resurrecting a claimable step inside a run that is already over. Cancel it
+// here, and the wake's `where status = 'blocked'` guard no longer matches.
 export async function cancelPendingSteps(sql: Db, runId: string): Promise<StepRow[]> {
   return sql<StepRow[]>`
-    update step set status = 'cancelled', updated_at = now()
-    where run_id = ${runId} and status in ('pending', 'ready')
+    update step set status = 'cancelled', awaited_child_run_id = null, updated_at = now()
+    where run_id = ${runId} and status in ('pending', 'ready', 'blocked')
     returning *
   `
 }
@@ -874,9 +884,13 @@ export async function finalizeCancelledRun(
       return { run: undefined, cancelledSteps: [] }
     }
 
+    // 'blocked' included for the reason spelled out on cancelPendingSteps:
+    // a step awaiting a child is not finished, it is suspended, and leaving
+    // it alone lets the child's terminal write wake it back into a run that
+    // has already been cancelled.
     const cancelledSteps = await tx<StepRow[]>`
-      update step set status = 'cancelled', updated_at = now()
-      where run_id = ${runId} and status in ('pending', 'ready')
+      update step set status = 'cancelled', awaited_child_run_id = null, updated_at = now()
+      where run_id = ${runId} and status in ('pending', 'ready', 'blocked')
       returning *
     `
 

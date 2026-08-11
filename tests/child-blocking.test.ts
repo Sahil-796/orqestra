@@ -356,4 +356,64 @@ describe('who does the waking', () => {
     expect(run.output).toEqual({ spawn: { outcome: 'child-was', status: 'cancelled' } })
     expect((await getRun(sql, childRunId))?.status).toBe('cancelled')
   }, 30_000)
+
+  test('cancelling the PARENT cancels its blocked step, and the child finishing cannot resurrect it', async () => {
+    // The inverse of the test above, and the case that is easy to get wrong:
+    // a blocked step looks inert (no lease, nobody running it), so run
+    // cancellation is tempting to write as "cancel pending/ready steps". But
+    // a blocked step is suspended, not finished — if cancellation skips it,
+    // the child's terminal write later wakes it back to `ready` inside a run
+    // that is already `cancelled`, leaving a claimable step in a dead run.
+    const namespace = `blocking-parent-cancel-${crypto.randomUUID()}`
+
+    const childWf = defineWorkflow(`bpc-child-${crypto.randomUUID()}`, (builder) => {
+      builder.step('slow', async (ctx) => {
+        await ctx.sleep('600ms')
+        return 'child-done'
+      })
+    })
+
+    const parentWf = defineWorkflow(`bpc-parent-${crypto.randomUUID()}`, (builder) => {
+      builder.step('spawn', async (ctx) => runChildWorkflow<string>(sql, ctx, childWf, { input: {} }))
+      builder.step('after', async () => 'after-ran', { dependsOn: ['spawn'] })
+    })
+
+    const { runId } = await enqueueRun(sql, parentWf, { namespace })
+
+    const worker = createWorker({
+      db: sql,
+      handles: [parentWf, childWf],
+      namespace,
+      concurrency: 2,
+      pollIntervalMs: 20,
+      leaseTtlMs: 5_000,
+    })
+    worker.start()
+
+    await until('parent step blocked', async () => (await step(runId, 'spawn')).status === 'blocked')
+    const childRunId = (await getChildRuns(sql, runId))[0]!.id
+
+    await cancelRun(sql, runId)
+
+    // Cancelled with the run, not left dangling — and no longer pointing at
+    // the child, so the wake's `status = 'blocked'` guard can't match it.
+    const cancelled = await step(runId, 'spawn')
+    expect(cancelled.status).toBe('cancelled')
+    expect(cancelled.awaited_child_run_id).toBeNull()
+
+    // Now let the child run to completion and fire the wake explicitly, the
+    // way any finalization path would. The parent step must stay cancelled.
+    await until(
+      'child run terminal',
+      async () => (await getRun(sql, childRunId))?.status === 'completed',
+      15_000
+    )
+    await wakeParentAwaiting(sql, childRunId)
+    await sweepBlockedChildAwaits(sql)
+
+    await worker.stop()
+    expect((await step(runId, 'spawn')).status).toBe('cancelled')
+    expect((await step(runId, 'after')).status).toBe('cancelled')
+    expect((await getRun(sql, runId))?.status).toBe('cancelled')
+  }, 30_000)
 })
