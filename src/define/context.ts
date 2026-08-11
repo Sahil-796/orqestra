@@ -29,6 +29,22 @@ function neverAbortedSignal(): AbortSignal {
   return new AbortController().signal
 }
 
+// Per-context accumulator for `ctx.skip()` requests, keyed by the ctx
+// object itself so the public `WorkflowContext` type never has to expose an
+// internal "read the requests back" method — `getSkipRequests` is the only
+// way in, and it's meant for executor.ts/worker.ts, not step code.
+const skipRequestsByContext = new WeakMap<WorkflowContext, string[]>()
+
+/**
+ * Read back the step names a just-finished step function passed to
+ * `ctx.skip(...)`, in call order, deduplicated. Returns `[]` if `skip` was
+ * never called (the overwhelmingly common case) or `ctx` wasn't built by
+ * `createWorkflowContext`.
+ */
+export function getSkipRequests(ctx: WorkflowContext): readonly string[] {
+  return skipRequestsByContext.get(ctx) ?? []
+}
+
 export interface WorkflowContext {
   /** The run's input, as passed to enqueue/run. */
   readonly input: unknown
@@ -62,6 +78,25 @@ export interface WorkflowContext {
 
   /** Suspend the run until a named event arrives. Phase 5. */
   waitForEvent<T = unknown>(eventKey: string): Promise<T>
+
+  /**
+   * Feature #17, conditional branching: declare that the named sibling
+   * steps (by `name`, within this run) are the untaken branch and should
+   * never run. Call this before returning from a step function — the
+   * request is only a note recorded on this context object; nothing is
+   * written to storage here (this function is plain/deterministic, same as
+   * `now`/`random`). The caller that runs the step (executor.ts / worker.ts)
+   * reads the accumulated names back via `getSkipRequests(ctx)` once the
+   * step function has returned, and turns them into `skipStep` calls as
+   * part of persisting this step's own successful outcome — so a skip only
+   * takes effect if the deciding step itself actually commits.
+   *
+   * Skipped steps still satisfy any downstream dependency that names them
+   * (see engine/scheduler.ts's `dependenciesSatisfied` and
+   * engine/dag.ts's `advanceDag`), so a fan-in join past an untaken branch
+   * is never left waiting forever.
+   */
+  skip(...stepNames: string[]): void
 }
 
 /**
@@ -93,8 +128,9 @@ export function createWorkflowContext(input: {
   const alreadyServed = input.sleepSeq ?? 0
   // Per-context (i.e. per-execution) counter of ctx.sleep() calls made so far.
   let sleepCalls = 0
+  const skipRequests: string[] = []
 
-  return {
+  const ctx: WorkflowContext = {
     input: input.input,
     runId: input.runId,
     signal: input.signal ?? neverAbortedSignal(),
@@ -113,5 +149,13 @@ export function createWorkflowContext(input: {
       })
     },
     waitForEvent: () => notImplemented('waitForEvent()', 'Phase 5'),
+    skip: (...stepNames: string[]): void => {
+      for (const name of stepNames) {
+        if (!skipRequests.includes(name)) skipRequests.push(name)
+      }
+    },
   }
+
+  skipRequestsByContext.set(ctx, skipRequests)
+  return ctx
 }

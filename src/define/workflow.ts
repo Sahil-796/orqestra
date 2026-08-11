@@ -2,6 +2,15 @@
 // serializable DAG definition (the `dag` jsonb) plus a handle that can
 // register that DAG into Postgres. Running the DAG is out of scope for
 // Phase 0 (Phase 1 adds the executor).
+//
+// Phase 4 orchestration additions, both expressed without any new schema:
+//   - fan-out (#15) / fan-in (#16): plain `dependsOn` — N steps depending on
+//     the same name fan out; one step depending on all N names fans back in.
+//     `fanOut()` below is sugar for generating the N steps; no new primitive.
+//   - conditional branching (#17): a step's function calls `ctx.skip(...)`
+//     (define/context.ts) naming sibling steps that are the untaken branch.
+//     No new builder method — it's an ordinary `.step()` whose function
+//     happens to call `ctx.skip`.
 
 import type { Db } from '../store/client.ts'
 import { getWorkflowByName, insertWorkflow, type WorkflowRow } from '../store/repositories.ts'
@@ -37,6 +46,43 @@ export class WorkflowBuilder {
       priority: options.priority ?? 0,
     })
     return this
+  }
+
+  /**
+   * Feature #15 sugar: register `count` steps that share one function body
+   * (parameterized by index), so a fan-out doesn't need `count` separate
+   * `.step()` calls with hand-rolled names. Fan-out itself needs no new
+   * schema or scheduling primitive — it falls out of ordinary `dependsOn`:
+   * N steps naming the same `dependsOn` all become `ready` together when
+   * that dependency resolves (see engine/dag.ts), and N workers can claim
+   * and run them in parallel because `claimNextStep` (queue/claim.ts) is
+   * already safe under concurrent claims.
+   *
+   * Returns the generated step names, in order — pass them as another
+   * step's `dependsOn` to fan back in (#16):
+   *
+   * ```ts
+   * builder.fanOut('shard', 10, (i, ctx) => processShard(i, ctx), { dependsOn: ['split'] })
+   * builder.step('combine', combineFn, { dependsOn: builder.fanOut(...) }) // see below
+   * ```
+   *
+   * (In practice, capture the returned array in a local rather than
+   * inlining a second call — `fanOut` registers steps as a side effect
+   * each time it's called.)
+   */
+  fanOut<T>(
+    namePrefix: string,
+    count: number,
+    fn: (index: number, ctx: WorkflowContext) => Promise<T>,
+    options: StepOptions = {}
+  ): string[] {
+    const names: string[] = []
+    for (let i = 0; i < count; i++) {
+      const name = `${namePrefix}-${i}`
+      names.push(name)
+      this.step(name, (ctx) => fn(i, ctx), options)
+    }
+    return names
   }
 
   /** @internal */
