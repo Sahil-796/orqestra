@@ -2,7 +2,19 @@
 
 export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 
-export type StepStatus = 'pending' | 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
+// Phase 4 adds two values (0004_orchestration.sql):
+//   'skipped' — an untaken conditional branch (#17); terminal, not an error.
+//   'blocked' — a step durably awaiting a child run's outcome (#20); like a
+//   sleeping step, it holds no lease while in this state.
+export type StepStatus =
+  | 'pending'
+  | 'ready'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'skipped'
+  | 'blocked'
 
 export const RUN_STATUSES: readonly RunStatus[] = [
   'queued',
@@ -19,6 +31,8 @@ export const STEP_STATUSES: readonly StepStatus[] = [
   'completed',
   'failed',
   'cancelled',
+  'skipped',
+  'blocked',
 ]
 
 // ---- workflow / step definitions -----------------------------------------
