@@ -33,6 +33,8 @@ export interface RunRow {
   started_at: Date | null
   finished_at: Date | null
   cancel_requested_at: Date | null
+  parent_run_id: string | null
+  parent_step_id: string | null
 }
 
 export interface StepRow {
@@ -55,6 +57,9 @@ export interface StepRow {
   sleeping_until: Date | null
   created_at: Date
   updated_at: Date
+  satisfied_deps: string[]
+  skip_reason: string | null
+  awaited_child_run_id: string | null
 }
 
 export interface HistoryRow {
@@ -111,6 +116,12 @@ export async function getWorkflowByName(
 // same key does not insert a second row. `created` tells the caller whether
 // this call actually inserted the row (and therefore whether steps still
 // need to be materialized) or found a pre-existing run for that key.
+//
+// `parentRunId`/`parentStepId` (Phase 4, #20 child workflows) are additive
+// and optional: pass both together when this run is a child spawned by a
+// step of another run, so `run.parent_run_id`/`run.parent_step_id` link it
+// back. Every existing caller that omits them behaves exactly as before —
+// both columns default to null.
 export async function createRun(
   sql: Db,
   input: {
@@ -119,17 +130,21 @@ export async function createRun(
     priority?: number
     input?: unknown
     idempotencyKey?: string
+    parentRunId?: string
+    parentStepId?: string
   }
 ): Promise<{ run: RunRow; created: boolean }> {
   if (input.idempotencyKey === undefined) {
     const rows = await sql<RunRow[]>`
-      insert into run (workflow_id, namespace, priority, input, idempotency_key)
+      insert into run (workflow_id, namespace, priority, input, idempotency_key, parent_run_id, parent_step_id)
       values (
         ${input.workflowId},
         ${input.namespace ?? 'default'},
         ${input.priority ?? 0},
         ${input.input === undefined ? null : sql.json(toJson(input.input))},
-        ${null}
+        ${null},
+        ${input.parentRunId ?? null},
+        ${input.parentStepId ?? null}
       )
       returning *
     `
@@ -139,13 +154,15 @@ export async function createRun(
   }
 
   const inserted = await sql<RunRow[]>`
-    insert into run (workflow_id, namespace, priority, input, idempotency_key)
+    insert into run (workflow_id, namespace, priority, input, idempotency_key, parent_run_id, parent_step_id)
     values (
       ${input.workflowId},
       ${input.namespace ?? 'default'},
       ${input.priority ?? 0},
       ${input.input === undefined ? null : sql.json(toJson(input.input))},
-      ${input.idempotencyKey}
+      ${input.idempotencyKey},
+      ${input.parentRunId ?? null},
+      ${input.parentStepId ?? null}
     )
     on conflict (idempotency_key) do nothing
     returning *
@@ -218,6 +235,79 @@ export async function getIncompleteRuns(sql: Db): Promise<RunRow[]> {
   return sql<RunRow[]>`
     select * from run where status in ('queued', 'running')
   `
+}
+
+// ---- child workflows (#20) -------------------------------------------------
+//
+// A child run is an ordinary `run` row (created via `createRun` with
+// `parentRunId`/`parentStepId` set) plus a step, somewhere in the parent
+// run, that is durably waiting on it. "Durably" is the operative word: the
+// parent step does not hold its worker lease for however long the child
+// takes (see 0004_orchestration.sql's rationale for `status = 'blocked'`) —
+// it releases back to storage the same way a sleeping step does, and is
+// woken by `resolveBlockedStepForChildRun` once the child finishes.
+
+// Every run spawned as a child of `parentRunId`, in creation order —
+// observability and the "await all children" shape both want this.
+export async function getChildRuns(sql: Db, parentRunId: string): Promise<RunRow[]> {
+  return sql<RunRow[]>`
+    select * from run where parent_run_id = ${parentRunId} order by created_at
+  `
+}
+
+// The step-side half of spawning a child run: park the step that spawned it
+// in `blocked` and record which child it's waiting on, releasing the lease
+// exactly like `sleepStep` (0003) does for a sleep — same fencing (only the
+// current lease holder may do this), same "give the worker back" shape, so
+// a long-running child (which may itself sleep, retry, or fan out) never
+// pins a worker slot for its whole lifetime.
+export async function blockStepOnChildRun(
+  sql: Db,
+  args: { stepId: string; workerId: string; childRunId: string }
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'blocked',
+      awaited_child_run_id = ${args.childRunId},
+      lease_owner = null,
+      lease_expires_at = null,
+      updated_at = now()
+    where id = ${args.stepId} and status = 'running' and lease_owner = ${args.workerId}
+    returning *
+  `
+  return rows[0]
+}
+
+// The wake side: called once a child run has reached a terminal status.
+// Finds the `blocked` step (if any) waiting on exactly this child — via
+// `awaited_child_run_id`, backed by `step_awaited_child_run_id_idx` — and
+// releases it back to `ready`, clearing the link. No lease to re-check
+// here: nobody holds one while a step is `blocked`, the same way nobody
+// holds one while a step is asleep. The step function replays from the top
+// on its next claim (the established replay contract — see 0003's
+// `sleepStep`) and reads the child's outcome via `getRun(childRunId)` or
+// `getChildRuns(parentRunId)`, exactly as a woken sleep re-reads
+// `sleep_seq` to know it's already served its sleep. The `exists` guard
+// means calling this before the child is actually terminal is a safe no-op,
+// not a premature release.
+export async function resolveBlockedStepForChildRun(
+  sql: Db,
+  childRunId: string
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'ready',
+      awaited_child_run_id = null,
+      updated_at = now()
+    where awaited_child_run_id = ${childRunId}
+      and status = 'blocked'
+      and exists (
+        select 1 from run
+        where id = ${childRunId} and status in ('completed', 'failed', 'cancelled')
+      )
+    returning *
+  `
+  return rows[0]
 }
 
 // ---- step ----------------------------------------------------------------
@@ -319,6 +409,104 @@ export async function resetRunningSteps(sql: Db, runId: string): Promise<void> {
     update step set status = 'ready', updated_at = now()
     where run_id = ${runId} and status = 'running'
   `
+}
+
+// ---- DAG: dependencies, fan-in, conditional branching (#15/#16/#17/#19) --
+//
+// engine/scheduler.ts's `newlyReadySteps` (Phase 1) already computes
+// readiness correctly by re-reading a run's whole step set under `lockRun`
+// — that stays the default path and this file does not change it. What's
+// added here is a second, narrower primitive for the case that rescan
+// approach makes expensive: a step with many fan-in parents, each
+// completing in its own worker's transaction. `recordDependencySatisfied`
+// lets each parent's completion touch only the one dependent row, and is
+// safe under concurrency without the run-level lock (see the migration
+// comment on `satisfied_deps` for why).
+
+// Every sibling step, in the same run, that `stepId` names in its
+// `depends_on` — i.e. its dependency set, resolved to full rows so a caller
+// can read their current status. Returns them in `depends_on` order isn't
+// guaranteed (the join has no ordering guarantee across dependency names),
+// so callers that care about order should re-sort by name themselves.
+export async function getDependencySteps(sql: Db, stepId: string): Promise<StepRow[]> {
+  return sql<StepRow[]>`
+    select dep.* from step s
+    join step dep on dep.run_id = s.run_id and dep.name = any(s.depends_on)
+    where s.id = ${stepId}
+  `
+}
+
+// Record that one of `stepId`'s named dependencies (`depName`) has
+// resolved — because it completed, or because it was skipped and the
+// caller has decided a skip counts as "satisfied" for this edge; this
+// function doesn't judge why, it just tracks which names have resolved and
+// releases the step the instant every name in `depends_on` is among them.
+//
+// Single statement, so the whole read-append-maybe-release sequence is one
+// row-level lock acquired and released by Postgres itself — no
+// application-level read-then-write, hence no window for two concurrent
+// callers to both observe "not yet satisfied" and neither one flip the
+// step to `ready` (the fan-in bug this exists to rule out), and no
+// deadlock (each call only ever touches the one row it's updating, and
+// only for the lifetime of this one statement).
+//
+// Returns the step's current row whether or not this call was the one that
+// released it — check `.status === 'ready'` to tell those apart. Returns
+// undefined if the step wasn't `pending` (already released by an earlier
+// call, or not a dependency-gated step at all) — a safe no-op, not an
+// error, since a duplicate delivery of the same dependency's resolution
+// should not be able to do anything.
+export async function recordDependencySatisfied(
+  sql: Db,
+  stepId: string,
+  depName: string
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    with appended as (
+      update step
+      set satisfied_deps = (
+            select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+          ),
+          updated_at = now()
+      where id = ${stepId} and status = 'pending'
+      returning *
+    ),
+    released as (
+      update step s
+      set status = 'ready', updated_at = now()
+      from appended a
+      where s.id = a.id and a.depends_on <@ a.satisfied_deps
+      returning s.*
+    )
+    select * from released
+    union all
+    select * from appended where id not in (select id from released)
+  `
+  return rows[0]
+}
+
+// Feature #17: mark a step as never going to run because the conditional
+// branch it belongs to was not taken. Terminal, but distinct from
+// `failed`/`cancelled` (see 0004_orchestration.sql) — nothing went wrong,
+// nothing was asked to stop, the workflow's own logic decided this path.
+// Allowed from `pending` or `ready` (a step can be skipped either before or
+// after its dependencies resolved, depending on when the branch decision
+// itself becomes known) but not from `running`/terminal states — those
+// need their own resolution path, not to be silently overwritten.
+export async function skipStep(
+  sql: Db,
+  stepId: string,
+  reason?: string
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'skipped',
+      skip_reason = ${reason ?? null},
+      updated_at = now()
+    where id = ${stepId} and status in ('pending', 'ready')
+    returning *
+  `
+  return rows[0]
 }
 
 // ---- queue: claim / lease / retry -----------------------------------------
