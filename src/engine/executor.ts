@@ -21,13 +21,14 @@ import {
   markStepReady,
   markStepRunning,
   resetRunningSteps,
+  skipStep,
   updateRunStatus,
   type NewStep,
   type RunRow,
   type StepRow,
 } from '../store/repositories.ts'
 import { decodeResult, serializeError, type RunStatus } from '../types.ts'
-import { createWorkflowContext } from '../define/context.ts'
+import { createWorkflowContext, getSkipRequests } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { createLogger } from '../observability/logger.ts'
 import { isRunComplete, newlyReadySteps } from './scheduler.ts'
@@ -212,6 +213,25 @@ async function runStep(
         type: 'step.completed',
         data: { result: value },
       })
+
+      // Feature #17, inline-driver half: apply any `ctx.skip(...)` requests
+      // made by this step. Deliberately simpler than worker.ts's
+      // advanceDag — no cascade-skip through a chain of branch-only steps,
+      // just the direct names this step named — because the next loop
+      // iteration's `advanceRun` rescan (scheduler.ts's
+      // `dependenciesSatisfied`, which now treats `skipped` as satisfied
+      // exactly like `completed`) picks up everything downstream from
+      // there. The inline path is single-process/sequential; the worker
+      // path (this phase's shipping bar) is where the full cascade policy
+      // lives.
+      const skipNames = getSkipRequests(ctx)
+      if (skipNames.length > 0) {
+        const siblings = await getStepsByRun(tx, run.id)
+        for (const name of skipNames) {
+          const target = siblings.find((s) => s.name === name)
+          if (target) await skipStep(tx, target.id, 'branch not taken')
+        }
+      }
     })
     return undefined
   } catch (e) {
@@ -275,6 +295,14 @@ export async function advanceRun(sql: Db, runId: string): Promise<AdvanceResult>
 
   const output: Record<string, unknown> = {}
   for (const step of steps) {
+    // Phase 4: a `skipped` step (#17's untaken branch) never ran and has no
+    // `result` to decode — `decodeResult` would throw on its null column.
+    // Its contribution to `output` is simply absent-of-a-value, same as
+    // what a completed-but-void step would produce.
+    if (step.status === 'skipped') {
+      output[step.name] = undefined
+      continue
+    }
     const decoded = decodeResult<unknown>(step.result)
     output[step.name] = decoded.ok ? decoded.value : undefined
   }

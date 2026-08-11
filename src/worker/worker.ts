@@ -27,7 +27,7 @@ import type { Db } from '../store/client.ts'
 import { withTransaction } from '../store/client.ts'
 import { claimStep } from '../queue/claim.ts'
 import { heartbeatLease, releaseLease, reclaimExpiredLeases } from '../queue/lease.ts'
-import { advanceRun } from '../engine/executor.ts'
+import { advanceDag } from '../engine/dag.ts'
 import {
   cancelPendingSteps,
   cancelRunningStep,
@@ -50,7 +50,7 @@ import {
   type StepRow,
 } from '../store/repositories.ts'
 import { serializeError } from '../types.ts'
-import { createWorkflowContext } from '../define/context.ts'
+import { createWorkflowContext, getSkipRequests, type WorkflowContext } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { DEFAULT_RETRY_POLICY, nextRunAfter, shouldRetry, type RetryPolicy } from '../engine/retry.ts'
 import { isSleepSignal, type SleepSignal } from '../engine/sleep.ts'
@@ -114,7 +114,10 @@ interface ResolvedRun {
 }
 
 type StepOutcome =
-  | { kind: 'success'; value: unknown }
+  // `skipNames` (Phase 4 #17): sibling step names this step's function
+  // handed to `ctx.skip(...)` before returning — the untaken branch,
+  // applied atomically alongside this step's own completion.
+  | { kind: 'success'; value: unknown; skipNames: readonly string[] }
   // `timedOut` only changes the history label — a timeout is an ordinary
   // failure as far as the retry/backoff decision is concerned (Phase 3 #10).
   | { kind: 'failure'; error: unknown; forcePermanent?: boolean; timedOut?: boolean }
@@ -125,7 +128,7 @@ type StepOutcome =
 // `sleep` (the step asked to be suspended) and `cancelled` (the run was
 // cancelled underneath it).
 type Attempt =
-  | { kind: 'success'; value: unknown }
+  | { kind: 'success'; value: unknown; skipNames: readonly string[] }
   | { kind: 'sleep'; signal: SleepSignal }
   | { kind: 'cancelled' }
   | { kind: 'timeout'; error: unknown }
@@ -210,7 +213,25 @@ export function createWorker(options: WorkerOptions): Worker {
           data: { result: outcome.value },
         })
         await releaseLease(tx, step.id)
-        await advanceRun(tx, run.id)
+
+        // Phase 4: fan-out/fan-in/dependency release (#15/#16/#19) via the
+        // narrow per-row primitive, plus any conditional-branch skips this
+        // step declared via ctx.skip() (#17) — see engine/dag.ts's module
+        // doc for why this replaces the old advanceRun(tx, run.id) rescan
+        // call here specifically (not in executor.ts's inline path, which
+        // keeps using advanceRun).
+        const { skippedSteps } = await advanceDag(tx, run.id, {
+          completedName: step.name,
+          skipNames: outcome.skipNames,
+        })
+        for (const skipped of skippedSteps) {
+          await insertHistory(tx, {
+            runId: run.id,
+            stepId: skipped.id,
+            type: 'step.skipped',
+            data: { reason: skipped.skip_reason },
+          })
+        }
         return
       }
 
@@ -474,6 +495,10 @@ export function createWorker(options: WorkerOptions): Worker {
     // in memory; nothing is written until the commit* call below, so a lease
     // that moved on can still discard all of it.
     let attempt: Attempt
+    // Hoisted so it survives past `withTimeout`'s callback — success needs
+    // to read `ctx.skip()` requests (feature #17) back out via
+    // `getSkipRequests` after `fn` has returned, not just its return value.
+    let ctx: WorkflowContext | undefined
     try {
       // Run the user function OUTSIDE any transaction — it may be slow or
       // call out to the world. Only the outcome's persistence is atomic.
@@ -486,19 +511,19 @@ export function createWorker(options: WorkerOptions): Worker {
       // across a worker restart), and the context resolves the first
       // `sleep_seq` sleep() calls immediately instead of suspending again.
       const value = await withTimeout(
-        (signal) =>
-          fn(
-            createWorkflowContext({
-              runId: run.id,
-              input: run.input,
-              sleepSeq: step.sleep_seq,
-              signal,
-            })
-          ),
+        (signal) => {
+          ctx = createWorkflowContext({
+            runId: run.id,
+            input: run.input,
+            sleepSeq: step.sleep_seq,
+            signal,
+          })
+          return fn(ctx)
+        },
         step.timeout_ms,
         cancelController.signal
       )
-      attempt = { kind: 'success', value }
+      attempt = { kind: 'success', value, skipNames: ctx ? getSkipRequests(ctx) : [] }
     } catch (e) {
       // Order matters. A SleepSignal is control flow, not a failure, and must
       // survive the timeout race untouched — withTimeout only ever *adds* a
@@ -532,7 +557,11 @@ export function createWorker(options: WorkerOptions): Worker {
 
     switch (attempt.kind) {
       case 'success':
-        await commitOutcome(step, run, { kind: 'success', value: attempt.value })
+        await commitOutcome(step, run, {
+          kind: 'success',
+          value: attempt.value,
+          skipNames: attempt.skipNames,
+        })
         return
       case 'sleep':
         await commitSleep(step, run, attempt.signal)
