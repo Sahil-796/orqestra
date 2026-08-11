@@ -132,6 +132,22 @@ async function cascadeIfAllDepsSkipped(sql: Db, dependent: StepRow): Promise<Ste
 
 The rule: if at least one dependency actually completed, proceed as a genuine `ready` — a real fan-in join past an untaken branch is unaffected the instant its live sibling completes. Only when *every* dependency resolved by being skipped does this step cascade to `skipped` too, and `propagate()` recurses on that cascade so a whole chain (branch → branch's child → that child's child) resolves within a single `advanceDag` call rather than needing N separate worker claims just to discover N consecutive no-ops.
 
+### Why `ctx.skip` is imperative, and where a declarative `when` would go
+
+The obvious objection to `ctx.skip('branch-b')` is that it reads backwards. The build plan describes this feature as *results steer conditional paths*, which sounds like a condition belonging to the edge — `{ dependsOn: ['decide'], when: (r) => r === 'took-b' }` — not like a step reaching out and naming its siblings by string.
+
+The reason it isn't built that way is that **a predicate is a closure, and a closure cannot be stored in Postgres.** So the real question is never which syntax is nicer; it is *who evaluates the predicate, and what are they holding while they do it.* There are two candidates:
+
+**The scheduler evaluates it.** `advanceDag` checks each dependent's `when` before releasing or skipping it. This is the natural reading of `when`, and it is the wrong place — it runs arbitrary user code inside the worker's commit transaction, while that transaction holds `FOR UPDATE` on the run row. Every other step commit on that run then queues behind however long the user's predicate takes. It also drags the workflow definition into a scheduling layer that is deliberately definition-agnostic, so a lock's duration would depend on which process happened to have the workflow registered.
+
+**The branch step evaluates it about itself.** A worker claims the branch step through the ordinary queue, and before running its body checks its own `when` against its dependencies' results: false → commit `skipped`, true → run. The predicate executes under a **lease**, not a lock, and that difference is the whole argument. A lease is the engine's existing answer to "user code is running and might not come back" — it has a TTL, the reaper reclaims it if the worker dies, and the commit is fenced on ownership exactly like any other outcome, so a slow predicate cannot stall anything but itself or produce a double-skip. A held row lock has none of those properties. This is the same rule Phase 1 set when it refused to hold a transaction across a step body, applied to a new kind of user code.
+
+So the layering, if `when` is added later: `ctx.skip` stays the primitive, and `when` becomes sugar that compiles down to the same `skipped` row, the same skip-satisfies-an-edge rule, the same cascade — evaluated worker-side at claim time. Not a second mechanism.
+
+Two things argue for keeping the imperative primitive public even once sugar exists. It expresses shapes a per-edge predicate can't ("skip three of these five", or a decision computed halfway through a step body). And its decision is *recorded*: a skip is a committed row, replayed from storage, whereas a `when` predicate is re-evaluated on every replay and therefore has to be pure. The durable form should be the one that doesn't depend on user purity.
+
+The genuine weakness in what shipped is narrower than the API shape: `'branch-b'` is an unchecked string, so renaming a step breaks its skips silently. `builder.step()` returns `this` today; returning a typed step handle (and accepting either) would turn that into a compile error without breaking anything.
+
 `tests/dag.test.ts` proves all three shapes: a two-way branch where the untaken side is skipped and the join runs on the taken branch alone; a chain three deep where the middle and the tail both cascade without ever executing; and a join whose *every* branch was skipped, which itself resolves to `skipped` rather than deadlocking.
 
 ---
