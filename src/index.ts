@@ -18,13 +18,15 @@ export type { StartRunOptions, RunResult, EnqueueRunResult, AdvanceResult } from
 export { SleepSignal, isSleepSignal, parseDuration } from './engine/sleep.ts'
 export { StepTimeoutError, isStepTimeoutError, withTimeout } from './engine/timeout.ts'
 
-// Phase 4 #20: child workflows. See src/control/child.ts's module doc for
-// the propagation policy and the honest limits of what's wired (child-await
-// is built on ctx.sleep, not the dedicated 'blocked' step status — that
-// needs a worker.ts hook outside this unit's scope).
+// Phase 4 #20: child workflows. The wait is event-driven — the parent step
+// suspends once into the `blocked` status and is woken by the child run's
+// terminal transition. See src/control/child.ts's module doc for the full
+// path and the propagation policy.
 export {
   ChildWorkflowError,
   isChildWorkflowError,
+  ChildBlockSignal,
+  isChildBlockSignal,
   classifyChildRun,
   isTerminalRunStatus,
   type ChildOutcome,
@@ -41,6 +43,7 @@ export {
   type ChildRunResult,
 } from './control/child.ts'
 export { nextChildCallSeq } from './define/context.ts'
+export { advanceDag, maybeFinalizeRun, wakeParentAwaiting, sweepBlockedChildAwaits } from './engine/dag.ts'
 
 export { createWorker } from './worker/worker.ts'
 export type { Worker, WorkerOptions } from './worker/worker.ts'

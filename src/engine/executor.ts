@@ -31,6 +31,7 @@ import { decodeResult, serializeError, type RunStatus } from '../types.ts'
 import { createWorkflowContext, getSkipRequests } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { createLogger } from '../observability/logger.ts'
+import { wakeParentAwaiting } from './dag.ts'
 import { isRunComplete, newlyReadySteps } from './scheduler.ts'
 
 const logger = createLogger()
@@ -195,11 +196,16 @@ async function runStep(
       await failStep(tx, step.id, error)
       await insertHistory(tx, { runId: run.id, stepId: step.id, type: 'step.failed', data: { error } })
       await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
+      // This run may itself be some other run's child (#20) — a run that
+      // ends `failed` must wake whoever is blocked on it just as surely as
+      // one that completes. Same transaction as the status write; see
+      // dag.ts's wakeParentAwaiting for why that ordering is required.
+      await wakeParentAwaiting(tx, run.id)
     })
     return { runId: run.id, status: 'failed' }
   }
 
-  const ctx = createWorkflowContext({ runId: run.id, input: run.input })
+  const ctx = createWorkflowContext({ runId: run.id, input: run.input, stepId: step.id })
 
   // Run the user function OUTSIDE a transaction (it may be slow / call out
   // to the world); only the persistence of its outcome is atomic.
@@ -240,6 +246,7 @@ async function runStep(
       await failStep(tx, step.id, error)
       await insertHistory(tx, { runId: run.id, stepId: step.id, type: 'step.failed', data: { error } })
       await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
+      await wakeParentAwaiting(tx, run.id)
     })
     return { runId: run.id, status: 'failed' }
   }
@@ -309,6 +316,11 @@ export async function advanceRun(sql: Db, runId: string): Promise<AdvanceResult>
 
   await updateRunStatus(sql, runId, 'completed', { output, finishedAt: new Date() })
   await insertHistory(sql, { runId, type: 'run.completed', data: { output } })
+  // #20: wake any step blocked on this run as a child. The worker path's
+  // equivalent lives in dag.ts's maybeFinalizeRun; this is the inline
+  // driver's copy, so a child run driven by executeRun still releases a
+  // parent that a worker pool is holding blocked.
+  await wakeParentAwaiting(sql, runId)
 
   return { steps, result: { runId, status: 'completed', output } }
 }
