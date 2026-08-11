@@ -194,6 +194,60 @@ is expressed as a future `run_after`, so a waiting retry occupies no worker.
 
 ---
 
+## Orchestration
+
+### Dependencies, fan-out and fan-in
+
+```ts
+const shards = builder.fanOut('shard', 10, async (i) => process(i), { dependsOn: ['seed'] })
+builder.step('combine', combineFn, { dependsOn: shards })
+```
+
+A step becomes claimable exactly when every step it names in `dependsOn` has resolved. Fan-out
+and fan-in need no special primitive: N steps naming the same dependency all become ready
+together and N workers claim them in parallel, and a join step naming all N runs once, after
+the last of them commits. The release is a single row update per completion, so ten workers
+finishing ten siblings at the same instant release the join exactly once.
+
+### Conditional branching
+
+```ts
+builder.step('decide', async (ctx) => {
+  if (!needsReview) ctx.skip('review')
+  return 'decided'
+})
+builder.step('review',  reviewFn,  { dependsOn: ['decide'] })
+builder.step('publish', publishFn, { dependsOn: ['decide', 'review'] })
+```
+
+`ctx.skip` names sibling steps that should not run. They are recorded as `skipped` — a
+terminal state, not an error — and a skipped dependency satisfies a downstream `dependsOn`
+exactly like a completed one, so `publish` still runs. Without that rule, an untaken branch
+would strand every join behind it forever.
+
+A skip only takes effect if the deciding step itself commits: calling `ctx.skip` and then
+throwing skips nothing. A step whose dependencies *all* resolved by being skipped is skipped
+too, rather than run against no real input, so an untaken branch's whole downstream chain
+resolves in one pass.
+
+### Child workflows
+
+```ts
+const result = await runChildWorkflow(db, ctx, childWorkflow, { input })
+```
+
+A step can start another workflow and wait for its result. Waiting is durable, the same way
+sleeping is: the parent step is written to `blocked`, its lease released and its worker freed,
+and it is woken by the child's terminal transition — not by a timer, and not by the process
+that spawned it. Kill that process and the parent still resumes when the child finishes.
+
+A failed or cancelled child throws `ChildWorkflowError` in the parent, which fails the parent
+step like any other error. Use `runChildWorkflowResult` to inspect the outcome instead of
+throwing. Awaiting a child costs no retry attempt, and cancelling a parent cancels its blocked
+step — though not, for now, the child run itself.
+
+---
+
 ## Configuration
 
 Configuration is read from the environment by `src/config.ts`, which fails fast with a clear
@@ -219,14 +273,14 @@ extend their lease, which decouples the TTL from step duration.
 ```
 src/
   define/          public API — defineWorkflow, WorkflowContext
-  engine/          the durable brain — executor, scheduler, retry, sleep, timeout
+  engine/          the durable brain — executor, scheduler, retry, sleep, timeout, dag, child
   queue/           claim (FOR UPDATE SKIP LOCKED) and lease
   worker/          the long-running process loop
   store/           Postgres only — every query lives here
     migrations/    append-only numbered SQL
     client.ts      the connection
     repositories.ts typed query functions
-  control/         cancellation; concurrency, rate limits and priority later
+  control/         cancellation and child runs; concurrency, rate limits and priority later
   triggers/        api · cron · webhook · event
   observability/   structured logger, metrics
   types.ts         core types + Result codec
@@ -291,3 +345,15 @@ mid-step and asserts that leases are reclaimed and completed steps are never re-
 ## Status
 
 orqestra is under active development and the public API is not stable.
+
+Built depth-first over nine phases (0–8), 35 features; the authoritative plan is
+[`docs/build-plan.html`](docs/build-plan.html), with per-phase notes in `docs/phase-N.md`.
+
+**Phases 0–4 are done:** the Postgres foundation, durable execution with crash recovery, the
+claim queue with expiring leases and concurrent workers, execution control (sleep, timeouts,
+cancellation), and orchestration (dependencies, fan-out/fan-in, conditional branching, child
+workflows).
+
+**Next is Phase 5 — signals & triggers:** `ctx.waitForEvent`, plus API, event, cron, delayed
+and webhook triggers. Phases 6–8 cover flow control at scale, failure handling, and
+observability.
