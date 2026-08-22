@@ -35,6 +35,40 @@ export const STEP_STATUSES: readonly StepStatus[] = [
   'blocked',
 ]
 
+// ---- signals & triggers (Phase 5) -----------------------------------------
+//
+// `ScheduleKind` mirrors the `schedules.kind` CHECK constraint
+// (0005_signals_triggers.sql) the same way `RunStatus`/`StepStatus` mirror
+// theirs — add a value in both places or the DB and the types drift.
+
+export type ScheduleKind = 'cron' | 'once'
+
+export const SCHEDULE_KINDS: readonly ScheduleKind[] = ['cron', 'once']
+
+/**
+ * A declarative trigger a workflow carries in its definition so the trigger
+ * daemon (Agent 3) can start runs of it without the workflow being invoked
+ * by hand. This is data only — declaring a trigger implements nothing; the
+ * daemon reads these and acts on them. A workflow may carry several.
+ *
+ *   - `event`: start a run whenever a matching event is published. An
+ *     optional `correlationKey` narrows which events count (same matching
+ *     rule as `waitForEvent`).
+ *   - `cron`: start a run on a cron schedule.
+ */
+export type WorkflowTrigger =
+  | { type: 'event'; event: string; correlationKey?: string }
+  | { type: 'cron'; cron: string }
+
+/** Options accepted by `ctx.waitForEvent(name, opts?)`. */
+export interface WaitForEventOptions {
+  /**
+   * Narrow the wait to events carrying this correlation value. Omit to be
+   * woken by any event of the given name.
+   */
+  correlationKey?: string
+}
+
 // ---- workflow / step definitions -----------------------------------------
 //
 // A `WorkflowDefinition` is the serializable DAG persisted into

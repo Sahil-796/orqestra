@@ -5,7 +5,7 @@
 import type postgres from 'postgres'
 import type { Db } from './client.ts'
 import { withTransaction } from './client.ts'
-import type { RunStatus, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
+import type { RunStatus, ScheduleKind, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
 import { encodeResult, ok, type Result } from '../types.ts'
 
 function toJson(value: unknown): postgres.JSONValue {
@@ -60,6 +60,13 @@ export interface StepRow {
   satisfied_deps: string[]
   skip_reason: string | null
   awaited_child_run_id: string | null
+  // Phase 5 (#18): what a `blocked` step is waiting for, if it's waiting on
+  // an event rather than a child run. `event_seq`/`event_payloads` are the
+  // replay-delivery pair, mirroring `sleep_seq` — see 0005's column comments.
+  waiting_event_name: string | null
+  waiting_event_correlation: string | null
+  event_seq: number
+  event_payloads: unknown[]
 }
 
 export interface HistoryRow {
@@ -739,7 +746,12 @@ export async function retryStep(
 // here, and the wake's `where status = 'blocked'` guard no longer matches.
 export async function cancelPendingSteps(sql: Db, runId: string): Promise<StepRow[]> {
   return sql<StepRow[]>`
-    update step set status = 'cancelled', awaited_child_run_id = null, updated_at = now()
+    update step set
+      status = 'cancelled',
+      awaited_child_run_id = null,
+      waiting_event_name = null,
+      waiting_event_correlation = null,
+      updated_at = now()
     where run_id = ${runId} and status in ('pending', 'ready', 'blocked')
     returning *
   `
@@ -889,7 +901,12 @@ export async function finalizeCancelledRun(
     // it alone lets the child's terminal write wake it back into a run that
     // has already been cancelled.
     const cancelledSteps = await tx<StepRow[]>`
-      update step set status = 'cancelled', awaited_child_run_id = null, updated_at = now()
+      update step set
+        status = 'cancelled',
+        awaited_child_run_id = null,
+        waiting_event_name = null,
+        waiting_event_correlation = null,
+        updated_at = now()
       where run_id = ${runId} and status in ('pending', 'ready', 'blocked')
       returning *
     `
@@ -969,4 +986,443 @@ export async function insertHistory(
   const row = rows[0]
   if (!row) throw new Error('insertHistory: insert returned no row')
   return row
+}
+
+// ---- signals & events (#18) -----------------------------------------------
+//
+// The events log is append-only (0005_signals_triggers.sql). `publishEvent`
+// is the single durable entry point for putting a signal into the system —
+// control/signal.ts (users + the CLI), Agent 2 (webhook ingress) and Agent 3
+// (event triggers) all funnel through it. It does two things atomically:
+// records the event, and wakes every `blocked` step whose recorded wait
+// matches. The wake is exactly-once by construction (the WHERE clause on the
+// UPDATE only touches steps that are still `blocked`, so a step that has
+// already been woken — or woken by a concurrent publish — is invisible to a
+// second matching publish).
+
+export interface EventRow {
+  id: string
+  name: string
+  correlation_key: string | null
+  payload: unknown
+  source: string
+  idempotency_key: string | null
+  created_at: Date
+  dispatched_at: Date | null
+}
+
+export interface PublishEventInput {
+  name: string
+  /** Narrows which waiters wake — only those with a matching (or absent) correlation. */
+  correlationKey?: string
+  payload?: unknown
+  /** Provenance label stored on the row — 'api' | 'webhook' | 'trigger' | … Defaults to 'api'. */
+  source?: string
+  /** Publish-side dedup: a repeat publish with the same key is a no-op (no second row, no second wake). */
+  idempotencyKey?: string
+}
+
+export interface PublishEventResult {
+  event: EventRow
+  /** False when `idempotencyKey` matched an existing event — nothing new was inserted or woken. */
+  created: boolean
+  /** Every `blocked` step this publish moved back to `ready`. */
+  woken: StepRow[]
+}
+
+// Wake every blocked step whose recorded wait matches this event, delivering
+// `payload` to each (appended to `event_payloads`, `event_seq` bumped so the
+// replayed context returns it). The matching rule, from the event's side:
+// wake a waiter whose name matches AND whose correlation is either absent (a
+// broad waiter, woken by any event of that name) or equal to the event's
+// correlation. A correlated waiter is therefore never woken by an
+// uncorrelated event, and never by an event with a different correlation.
+//
+// Exactly-once lives in the `status = 'blocked'` guard: the UPDATE flips the
+// step to `ready` in the same statement, so the row leaves the matched set
+// atomically and no second matching publish (or the throw->block backstop)
+// can wake or double-deliver to it.
+export async function wakeStepsWaitingForEvent(
+  sql: Db,
+  args: { name: string; correlationKey?: string; payload?: unknown }
+): Promise<StepRow[]> {
+  const payloadJson = sql.json(toJson(args.payload ?? null))
+  return sql<StepRow[]>`
+    update step set
+      status = 'ready',
+      waiting_event_name = null,
+      waiting_event_correlation = null,
+      event_seq = event_seq + 1,
+      event_payloads = event_payloads || jsonb_build_array(${payloadJson}),
+      updated_at = now()
+    where status = 'blocked'
+      and waiting_event_name = ${args.name}
+      and (waiting_event_correlation is null or waiting_event_correlation = ${args.correlationKey ?? null})
+    returning *
+  `
+}
+
+// The single durable entry point for publishing a signal. Insert the event
+// (idempotently when a key is supplied), then wake matching waiters — both in
+// one transaction so an event is never recorded without its wake, nor a wake
+// applied without the durable record behind it. A redelivery (same
+// idempotency key) inserts nothing and wakes nothing: the first publish
+// already woke whoever was waiting, and re-waking on a duplicate is precisely
+// the double-delivery the key exists to prevent.
+export async function publishEvent(
+  sql: Db,
+  input: PublishEventInput
+): Promise<PublishEventResult> {
+  return withTransaction(sql, async (tx) => {
+    let event: EventRow
+    let created: boolean
+
+    if (input.idempotencyKey === undefined) {
+      const rows = await tx<EventRow[]>`
+        insert into events (name, correlation_key, payload, source, idempotency_key)
+        values (
+          ${input.name},
+          ${input.correlationKey ?? null},
+          ${input.payload === undefined ? null : tx.json(toJson(input.payload))},
+          ${input.source ?? 'api'},
+          ${null}
+        )
+        returning *
+      `
+      const row = rows[0]
+      if (!row) throw new Error('publishEvent: insert returned no row')
+      event = row
+      created = true
+    } else {
+      const inserted = await tx<EventRow[]>`
+        insert into events (name, correlation_key, payload, source, idempotency_key)
+        values (
+          ${input.name},
+          ${input.correlationKey ?? null},
+          ${input.payload === undefined ? null : tx.json(toJson(input.payload))},
+          ${input.source ?? 'api'},
+          ${input.idempotencyKey}
+        )
+        on conflict (idempotency_key) do nothing
+        returning *
+      `
+      const insertedRow = inserted[0]
+      if (insertedRow) {
+        event = insertedRow
+        created = true
+      } else {
+        const existing = await tx<EventRow[]>`
+          select * from events where idempotency_key = ${input.idempotencyKey}
+        `
+        const existingRow = existing[0]
+        if (!existingRow) throw new Error('publishEvent: idempotency conflict but no existing row found')
+        return { event: existingRow, created: false, woken: [] }
+      }
+    }
+
+    const woken = await wakeStepsWaitingForEvent(tx, {
+      name: input.name,
+      correlationKey: input.correlationKey,
+      payload: input.payload,
+    })
+    return { event, created, woken }
+  })
+}
+
+// Suspend a running step waiting for an event. Fenced on lease ownership
+// exactly like sleepStep / blockStepOnChildRun: the WHERE clause only matches
+// while this worker still owns a `running` lease, so a worker whose lease was
+// reclaimed underneath it writes nothing. `attempt - 1` gives back the
+// attempt that claiming consumed — a wait is not a failed try — same as sleep
+// and child-block. The lease is cleared as part of parking the row, so no
+// separate releaseStep is needed.
+// `workerId` fences on lease ownership (the worker path); omit it for the
+// inline single-process driver (engine/executor.ts), which holds no lease —
+// there the `status = 'running'` guard alone is the whole safety story, since
+// nothing else is touching the row.
+export async function registerStepEventWait(
+  sql: Db,
+  args: { stepId: string; eventName: string; correlationKey?: string; workerId?: string }
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'blocked',
+      waiting_event_name = ${args.eventName},
+      waiting_event_correlation = ${args.correlationKey ?? null},
+      attempt = greatest(attempt - 1, 0),
+      lease_owner = null,
+      lease_expires_at = null,
+      updated_at = now()
+    where id = ${args.stepId} and status = 'running'
+      and (${args.workerId ?? null}::text is null or lease_owner = ${args.workerId ?? null})
+    returning *
+  `
+  return rows[0]
+}
+
+// The throw->block race backstop. A step decides to wait and throws its
+// signal; a matching event can be published in the window before the worker
+// commits the `blocked` row, and `publishEvent`'s live wake would miss it
+// (the step is still `running`, not yet `blocked`). So the block commit,
+// after writing the `blocked` row, asks whether a matching event already
+// landed at or after this attempt began (`since`) — if so it wakes itself in
+// place. `since` is the worker's attempt-start instant; an event from before
+// this attempt is deliberately excluded (no unbounded backlog replay). See
+// worker.ts's commitEventWait for the full ordering argument.
+export async function findMatchingEventSince(
+  sql: Db,
+  args: { name: string; correlationKey?: string; since: Date }
+): Promise<EventRow | undefined> {
+  const rows = await sql<EventRow[]>`
+    select * from events
+    where name = ${args.name}
+      and (${args.correlationKey ?? null}::text is null or correlation_key = ${args.correlationKey ?? null})
+      and created_at >= ${args.since}
+    order by created_at, id
+    limit 1
+  `
+  return rows[0]
+}
+
+// Observability / tests: which steps are parked waiting for an event right
+// now (as opposed to blocked on a child run — both are `blocked`, only the
+// waiting_event_name / awaited_child_run_id columns tell them apart).
+export async function getStepsWaitingForEvent(sql: Db, runId?: string): Promise<StepRow[]> {
+  const runFilter = runId ? sql`and run_id = ${runId}` : sql``
+  return sql<StepRow[]>`
+    select * from step
+    where status = 'blocked' and waiting_event_name is not null
+      ${runFilter}
+    order by updated_at
+  `
+}
+
+// ---- event-trigger routing (Agent 3) --------------------------------------
+//
+// The trigger daemon claims undispatched events, maps them to
+// event-triggered workflows, starts runs, and stamps `dispatched_at` so each
+// event is routed at most once. `claimUndispatchedEvents` does the claim
+// atomically (FOR UPDATE SKIP LOCKED + stamp) so two daemon instances never
+// both route the same event.
+
+export async function claimUndispatchedEvents(sql: Db, limit = 100): Promise<EventRow[]> {
+  return sql<EventRow[]>`
+    update events set dispatched_at = now()
+    where id in (
+      select id from events
+      where dispatched_at is null
+      order by created_at, id
+      for update skip locked
+      limit ${limit}
+    )
+    returning *
+  `
+}
+
+// Non-claiming read, for observability or a daemon that wants to inspect
+// before it routes. `claimUndispatchedEvents` is the one to drive routing.
+export async function getUndispatchedEvents(sql: Db, limit = 100): Promise<EventRow[]> {
+  return sql<EventRow[]>`
+    select * from events where dispatched_at is null
+    order by created_at, id
+    limit ${limit}
+  `
+}
+
+// ---- schedules: time-based starts (Agents 2 & 3) --------------------------
+
+export interface ScheduleRow {
+  id: string
+  workflow_name: string
+  kind: ScheduleKind
+  cron_expression: string | null
+  next_run_at: Date
+  input: unknown
+  namespace: string
+  priority: number
+  enabled: boolean
+  last_fired_at: Date | null
+  created_at: Date
+  updated_at: Date
+}
+
+export interface CreateScheduleInput {
+  workflowName: string
+  kind: ScheduleKind
+  /** Required when `kind` is 'cron', rejected (by the CHECK) when 'once'. */
+  cronExpression?: string
+  nextRunAt: Date
+  input?: unknown
+  namespace?: string
+  priority?: number
+  enabled?: boolean
+}
+
+// Register a schedule row. Agent 2 uses this for delayed / one-shot starts
+// ('once'); Agent 3 for cron registration. The cron-expression/kind
+// coherence is enforced by the DB CHECK, so a 'cron' with no expression (or
+// a 'once' with one) fails loudly here rather than misbehaving in the poller.
+export async function createSchedule(sql: Db, input: CreateScheduleInput): Promise<ScheduleRow> {
+  const rows = await sql<ScheduleRow[]>`
+    insert into schedules (workflow_name, kind, cron_expression, next_run_at, input, namespace, priority, enabled)
+    values (
+      ${input.workflowName},
+      ${input.kind},
+      ${input.cronExpression ?? null},
+      ${input.nextRunAt},
+      ${input.input === undefined ? null : sql.json(toJson(input.input))},
+      ${input.namespace ?? 'default'},
+      ${input.priority ?? 0},
+      ${input.enabled ?? true}
+    )
+    returning *
+  `
+  const row = rows[0]
+  if (!row) throw new Error('createSchedule: insert returned no row')
+  return row
+}
+
+export async function getSchedule(sql: Db, id: string): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`select * from schedules where id = ${id}`
+  return rows[0]
+}
+
+// The poller's atomic claim. Returns due, enabled schedules and, in the same
+// statement, pushes their `next_run_at` forward by `guardMs` so a second
+// poller (or the same poller on its next tick, before this batch has been
+// fired and rescheduled) does not re-claim them. The caller then fires each
+// run and calls `rescheduleCron` (sets the real next occurrence, overwriting
+// the guard bump) or `markScheduleFired` (disables a 'once'). FOR UPDATE SKIP
+// LOCKED keeps concurrent pollers from contending on the same rows.
+//
+// The guard bump is a safety net, not the schedule's real cadence: a poller
+// that claims and then crashes before rescheduling leaves the schedule due
+// again `guardMs` later, so nothing is lost — it just fires late.
+export async function claimDueSchedules(
+  sql: Db,
+  now: Date,
+  limit = 100,
+  guardMs = 60_000
+): Promise<ScheduleRow[]> {
+  return sql<ScheduleRow[]>`
+    update schedules set
+      next_run_at = ${now} + (${guardMs} * interval '1 millisecond'),
+      updated_at = now()
+    where id in (
+      select id from schedules
+      where enabled and next_run_at <= ${now}
+      order by next_run_at
+      for update skip locked
+      limit ${limit}
+    )
+    returning *
+  `
+}
+
+// Record that a schedule fired. For a 'once' schedule this also disables it —
+// a one-shot has done its job and must never fire again. For a 'cron'
+// schedule use `rescheduleCron` instead (it sets the next occurrence); calling
+// this on a cron would stop it dead.
+export async function markScheduleFired(sql: Db, id: string, firedAt: Date): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    update schedules set
+      last_fired_at = ${firedAt},
+      enabled = case when kind = 'once' then false else enabled end,
+      updated_at = now()
+    where id = ${id}
+    returning *
+  `
+  return rows[0]
+}
+
+// Advance a cron schedule to its next occurrence after firing. The caller
+// (Agent 3) computes `nextRunAt` from the cron expression — this layer does
+// no cron maths. Overwrites the guard bump `claimDueSchedules` applied.
+export async function rescheduleCron(
+  sql: Db,
+  id: string,
+  nextRunAt: Date,
+  firedAt: Date
+): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    update schedules set
+      next_run_at = ${nextRunAt},
+      last_fired_at = ${firedAt},
+      updated_at = now()
+    where id = ${id} and kind = 'cron'
+    returning *
+  `
+  return rows[0]
+}
+
+// Pause / resume a schedule without deleting it.
+export async function setScheduleEnabled(sql: Db, id: string, enabled: boolean): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    update schedules set enabled = ${enabled}, updated_at = now()
+    where id = ${id}
+    returning *
+  `
+  return rows[0]
+}
+
+// ---- start a run by workflow name (Agents 2 & 3) --------------------------
+//
+// The programmatic-trigger entry point. `enqueueRun`/`startRun`
+// (engine/executor.ts) need an in-process `WorkflowHandle` — fine for a step
+// spawning a child, wrong for a daemon that only knows a workflow *name* and
+// an input. This starts a run from the workflow's stored `dag` (the durable
+// `WorkflowDefinition`): register-free, no handle required. It materializes
+// the step rows exactly as `registerAndCreateRun` does, so any worker pool
+// that has the workflow registered drains it normally. Idempotent when
+// `idempotencyKey` is supplied, same as `createRun`.
+
+export interface StartRunByNameInput {
+  workflowName: string
+  version?: number
+  input?: unknown
+  namespace?: string
+  priority?: number
+  idempotencyKey?: string
+}
+
+export interface StartRunByNameResult {
+  runId: string
+  workflowId: string
+  created: boolean
+}
+
+export async function startRunForWorkflowName(
+  sql: Db,
+  input: StartRunByNameInput
+): Promise<StartRunByNameResult> {
+  const workflow = await getWorkflowByName(sql, input.workflowName, input.version)
+  if (!workflow) {
+    throw new Error(`startRunForWorkflowName: no workflow registered under name "${input.workflowName}"`)
+  }
+
+  const { run, created } = await createRun(sql, {
+    workflowId: workflow.id,
+    namespace: input.namespace,
+    priority: input.priority,
+    input: input.input,
+    idempotencyKey: input.idempotencyKey,
+  })
+
+  if (!created) return { runId: run.id, workflowId: workflow.id, created: false }
+
+  const steps: NewStep[] = workflow.dag.steps.map((step) => ({
+    name: step.name,
+    dependsOn: step.dependsOn,
+    maxAttempts: step.maxAttempts,
+    timeoutMs: step.timeoutMs,
+    priority: step.priority,
+    status: step.dependsOn.length === 0 ? 'ready' : 'pending',
+  }))
+
+  await withTransaction(sql, async (tx) => {
+    await insertSteps(tx, run.id, steps)
+    await insertHistory(tx, { runId: run.id, type: 'run.created', data: { input: input.input } })
+  })
+
+  return { runId: run.id, workflowId: workflow.id, created: true }
 }
