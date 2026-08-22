@@ -14,7 +14,8 @@
 
 import type { Db } from '../store/client.ts'
 import { getWorkflowByName, insertWorkflow, type WorkflowRow } from '../store/repositories.ts'
-import type { StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
+import type { ConcurrencyLimit, StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
+import { validateConcurrency } from '../control/concurrency.ts'
 import type { WorkflowContext } from './context.ts'
 
 export type StepFn<T = unknown> = (ctx: WorkflowContext) => Promise<T>
@@ -25,6 +26,12 @@ export interface StepOptions {
   maxAttempts?: number
   timeoutMs?: number
   priority?: number
+  /**
+   * Concurrency cap for this step (#12): at most `limit` steps sharing `key`
+   * may be `running` at once, across every run. Omit for the unlimited common
+   * case. `limit` must be a positive integer, or `defineWorkflow` throws.
+   */
+  concurrency?: ConcurrencyLimit
 }
 
 export class WorkflowBuilder {
@@ -44,6 +51,7 @@ export class WorkflowBuilder {
       maxAttempts: options.maxAttempts ?? 1,
       timeoutMs: options.timeoutMs,
       priority: options.priority ?? 0,
+      concurrency: validateConcurrency(name, options.concurrency),
     })
     return this
   }
@@ -132,6 +140,8 @@ function stepsEqual(a: StepDefinition, b: StepDefinition): boolean {
     a.maxAttempts === b.maxAttempts &&
     a.timeoutMs === b.timeoutMs &&
     a.priority === b.priority &&
+    (a.concurrency?.key ?? null) === (b.concurrency?.key ?? null) &&
+    (a.concurrency?.limit ?? null) === (b.concurrency?.limit ?? null) &&
     a.dependsOn.length === b.dependsOn.length &&
     a.dependsOn.every((dep, i) => dep === b.dependsOn[i])
   )

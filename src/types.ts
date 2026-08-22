@@ -76,12 +76,29 @@ export interface WaitForEventOptions {
 // in-process (registered via defineWorkflow), keyed by step name, so the
 // engine can look them up when it replays a run.
 
+// ---- flow control at scale (Phase 6) --------------------------------------
+//
+// A step may declare a concurrency *key* and a *limit* (#12): at claim time it
+// is only claimable if fewer than `limit` steps sharing that key are currently
+// `running`. This is data on the step definition — the enforcement lives in the
+// claim query (repositories.ts `claimNextStep`) and its policy helpers in
+// control/concurrency.ts. A step with no `concurrency` is unlimited (the common
+// case), and the un-keyed claim path is unaffected.
+export interface ConcurrencyLimit {
+  /** Steps sharing this key contend for the same limit, across all runs. */
+  key: string
+  /** Max steps with this key allowed `running` at once. Must be >= 1. */
+  limit: number
+}
+
 export interface StepDefinition {
   name: string
   dependsOn: string[]
   maxAttempts: number
   timeoutMs?: number
   priority: number
+  /** Concurrency cap for this step (#12). Absent = unlimited. */
+  concurrency?: ConcurrencyLimit
 }
 
 export interface WorkflowDefinition {
