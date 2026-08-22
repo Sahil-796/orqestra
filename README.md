@@ -303,6 +303,46 @@ process *restart*, not just within one process, so a redeploy never duplicates a
 
 ---
 
+## Flow control at scale
+
+Phase 6 adds three ways to keep the queue honest under load — all enforced atomically inside
+the same claim transaction that already does `FOR UPDATE SKIP LOCKED`, with no extra
+infrastructure.
+
+```ts
+wf.step('chargeCard', chargeFn, {
+  concurrency: { key: 'payment-processor', limit: 3 },       // #12: at most 3 running at once
+})
+
+wf.step('callPartnerApi', callFn, {
+  rateLimit: { key: 'partner-api', limit: 100, windowMs: 60_000 }, // #13: at most 100 starts/min
+})
+
+wf.step('notifyCustomer', notifyFn, { priority: 10 })         // #14: claimed ahead of priority 0
+```
+
+**Concurrency limits (#12)** cap how many steps sharing a key are `running` at once, globally —
+not per-worker, not per-run. A step blocked by a full key just stays `ready` and is retried on
+the next poll.
+
+**Rate limiting (#13)** caps how many steps sharing a key may *start* per fixed window. A step
+that would exceed the window's budget is deferred — its `run_after` pushed to the next window
+boundary — rather than failed; it becomes claimable again the moment fresh budget exists.
+
+**Priorities + fairness (#14)** let higher-priority steps be claimed first, with *aging* so a
+flood of high-priority work can't starve normal-priority steps forever: the longer a step
+waits, the more its effective priority climbs, until it eventually outranks even fresh
+high-priority work.
+
+Both limits are closed against the same race: a naive `count(*) < limit` check lets two
+concurrent claimers each read a stale "under limit" count and both claim. The fix is a
+per-key `pg_advisory_xact_lock` that serializes same-key claims (and only same-key claims —
+different keys, and the un-keyed fast path, never contend) so the recount under the lock is
+always a fresh, authoritative snapshot. See [`docs/phase-6.md`](docs/phase-6.md) for the full
+design, including the fixed-window rate model and the aging formula.
+
+---
+
 ## Configuration
 
 Configuration is read from the environment by `src/config.ts`, which fails fast with a clear
@@ -318,6 +358,8 @@ error on malformed input.
 | `ORQ_WORKER_CONCURRENCY` | `1`                                                  | Max steps one worker runs at once               |
 | `ORQ_HTTP_HOST`          | `0.0.0.0`                                             | Trigger server bind host                        |
 | `ORQ_HTTP_PORT`          | `3000`                                               | Trigger server bind port                        |
+| `ORQ_PRIORITY_AGE_RATE_PER_SEC` | `1`                                            | Priority points added per second a step has waited (`0` disables aging) |
+| `ORQ_PRIORITY_AGE_MAX_BOOST`    | `100`                                          | Cap on the aging boost                          |
 
 Lease TTL is the tuning knob that matters: too short and healthy long steps get reclaimed
 and double-run; too long and a crashed worker's job stalls. In-flight steps heartbeat to
@@ -337,7 +379,7 @@ src/
     migrations/    append-only numbered SQL
     client.ts      the connection
     repositories.ts typed query functions
-  control/         cancellation and child runs; concurrency, rate limits and priority later
+  control/         cancellation, child runs, concurrency limits, rate limiting, priority aging
   triggers/        api · cron · webhook · event
   observability/   structured logger, metrics
   types.ts         core types + Result codec
@@ -359,6 +401,7 @@ The core tables carry the whole engine.
 | `step`              | The queue and the durable step log, unified — plus what a blocked step is waiting for |
 | `events`            | Published signals/events — an append-only log             |
 | `schedules`         | Cron, delayed and one-shot run starts                     |
+| `rate_window`       | Per-key, per-window start counters for rate limiting (#13) |
 | `history`           | Append-only observability spine                           |
 | `dead_letter`       | Runs that exhausted their retries                         |
 | `schema_migrations` | Which migrations have been applied                        |
@@ -382,6 +425,7 @@ Runnable against a local Postgres:
 bun run examples/durable.ts            # a DAG that fans out and back in
 bun run examples/workers.ts            # 3 workers draining one queue, with a retry
 bun run examples/sleeping-workflow.ts  # a step that sleeps and releases its worker
+bun run examples/flow-control.ts       # concurrency limits, rate limiting and priority together
 ```
 
 ---
@@ -409,11 +453,12 @@ orqestra is under active development and the public API is not stable.
 Built depth-first over nine phases (0–8), 35 features; the authoritative plan is
 [`docs/build-plan.html`](docs/build-plan.html), with per-phase notes in `docs/phase-N.md`.
 
-**Phases 0–5 are done:** the Postgres foundation, durable execution with crash recovery, the
+**Phases 0–6 are done:** the Postgres foundation, durable execution with crash recovery, the
 claim queue with expiring leases and concurrent workers, execution control (sleep, timeouts,
 cancellation), orchestration (dependencies, fan-out/fan-in, conditional branching, child
-workflows), and signals & triggers (`ctx.waitForEvent`, plus API, event, cron, delayed and
-webhook starts).
+workflows), signals & triggers (`ctx.waitForEvent`, plus API, event, cron, delayed and
+webhook starts), and flow control at scale (concurrency limits, rate limiting, priorities with
+anti-starvation aging).
 
-**Next is Phase 6 — flow control at scale:** concurrency limits, rate limiting and priorities,
-where Redis first earns a place. Phases 7–8 cover failure handling and observability.
+**Next is Phase 7 — failure handling:** dead-letter queues and compensation. Phase 8 covers
+observability.
