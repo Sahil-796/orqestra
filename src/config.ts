@@ -16,6 +16,15 @@ export interface OrqConfig {
   httpHost: string
   /** HTTP trigger server bind port. */
   httpPort: number
+  /**
+   * Priority aging rate (#14): priority points added to a step's base priority
+   * per second it has been ready, so a long-waiting low-priority step is not
+   * starved by fresh high-priority floods. 0 disables aging.
+   */
+  priorityAgeRatePerSec: number
+  /** Upper bound on the aging boost (#14) — aging lifts a step into contention
+   *  but never to unbounded priority. */
+  priorityAgeMaxBoost: number
 }
 
 const DEFAULT_DATABASE_URL = 'postgres://orqestra:orqestra@localhost:5433/orqestra'
@@ -26,6 +35,12 @@ const DEFAULT_POLL_INTERVAL_MS = 200
 const DEFAULT_WORKER_CONCURRENCY = 1
 const DEFAULT_HTTP_HOST = '0.0.0.0'
 const DEFAULT_HTTP_PORT = 3000
+// Aging on by default, but gentle: 1 point/sec, capped at 100. A step at the
+// default priority (0) waiting ~100s reaches the effective priority of a fresh
+// step at priority 100, so ordinary work is never starved indefinitely — while
+// freshly-claimed steps (age ~0) sort exactly by base priority as before.
+const DEFAULT_PRIORITY_AGE_RATE_PER_SEC = 1
+const DEFAULT_PRIORITY_AGE_MAX_BOOST = 100
 
 const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error']
 
@@ -91,6 +106,15 @@ function parseHttpPort(raw: string | undefined): number {
   return n
 }
 
+function parseNonNegativeNumber(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`${name} must be a non-negative number, got: ${raw}`)
+  }
+  return n
+}
+
 function parseDatabaseUrl(raw: string | undefined): string {
   const url = raw && raw !== '' ? raw : DEFAULT_DATABASE_URL
   try {
@@ -112,5 +136,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): OrqConfig {
     workerConcurrency: parseWorkerConcurrency(env.ORQ_WORKER_CONCURRENCY),
     httpHost: parseHttpHost(env.ORQ_HTTP_HOST),
     httpPort: parseHttpPort(env.ORQ_HTTP_PORT),
+    priorityAgeRatePerSec: parseNonNegativeNumber(
+      env.ORQ_PRIORITY_AGE_RATE_PER_SEC,
+      DEFAULT_PRIORITY_AGE_RATE_PER_SEC,
+      'ORQ_PRIORITY_AGE_RATE_PER_SEC'
+    ),
+    priorityAgeMaxBoost: parseNonNegativeNumber(
+      env.ORQ_PRIORITY_AGE_MAX_BOOST,
+      DEFAULT_PRIORITY_AGE_MAX_BOOST,
+      'ORQ_PRIORITY_AGE_MAX_BOOST'
+    ),
   }
 }

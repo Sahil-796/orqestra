@@ -75,6 +75,17 @@ export {
   syncCronSchedules,
 } from './triggers/cron.ts'
 
+// Phase 6 — Flow control at scale. Concurrency limits (#12): a step declares a
+// concurrency key + limit and the claim query enforces "at most N running for
+// this key" atomically under a flood of concurrent claims. Priority aging
+// (#14): the claim orders by an effective priority that grows with wait time,
+// so normal-priority work is not starved by high-priority floods.
+export { validateConcurrency, isConcurrencyLimited } from './control/concurrency.ts'
+export { effectivePriority, ageBoost } from './control/priority.ts'
+export type { PriorityAgingConfig } from './control/priority.ts'
+// `ConcurrencyLimit` (the step-declaration type) is already re-exported via
+// `export * from './types.ts'` below.
+
 export type { OrqConfig, LogLevel } from './config.ts'
 export { loadConfig } from './config.ts'
 
