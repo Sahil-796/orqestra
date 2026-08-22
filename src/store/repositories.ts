@@ -52,6 +52,10 @@ export interface StepRow {
   lease_expires_at: Date | null
   timeout_ms: number | null
   priority: number
+  // Phase 6 (#12): declared concurrency cap, persisted onto the row so the
+  // claim query is self-contained. Both null = unlimited (the common case).
+  concurrency_key: string | null
+  concurrency_limit: number | null
   reclaim_count: number
   sleep_seq: number
   sleeping_until: Date | null
@@ -340,6 +344,11 @@ export interface NewStep {
   timeoutMs?: number
   priority: number
   status: StepStatus
+  // Phase 6 (#12): optional concurrency cap. Both omitted = unlimited. When
+  // present they must agree (key + positive limit) — the DB CHECK
+  // (0006_flow_control.sql) rejects a half-declared pair.
+  concurrencyKey?: string
+  concurrencyLimit?: number
 }
 
 export async function insertSteps(sql: Db, runId: string, steps: NewStep[]): Promise<StepRow[]> {
@@ -351,6 +360,8 @@ export async function insertSteps(sql: Db, runId: string, steps: NewStep[]): Pro
     max_attempts: step.maxAttempts,
     timeout_ms: step.timeoutMs ?? null,
     priority: step.priority,
+    concurrency_key: step.concurrencyKey ?? null,
+    concurrency_limit: step.concurrencyLimit ?? null,
     depends_on: step.dependsOn,
   }))
   return sql<StepRow[]>`
@@ -537,6 +548,14 @@ export interface ClaimStepOptions {
   workerId: string
   leaseTtlMs: number
   namespace?: string
+  // Phase 6 (#14) priority aging. `priorityAgeRatePerSec` priority points are
+  // added to a step's base priority per second it has been ready (age measured
+  // from `run_after`), capped at `priorityAgeMaxBoost`. Both default to 0, which
+  // disables aging and makes the claim order by `priority desc, run_after` —
+  // exactly the pre-Phase-6 behaviour. queue/claim.ts fills these from config so
+  // the worker path gets aging without every caller passing them.
+  priorityAgeRatePerSec?: number
+  priorityAgeMaxBoost?: number
 }
 
 // The queue claim, straight from the build plan: SKIP LOCKED lets any
@@ -549,10 +568,42 @@ export interface ClaimStepOptions {
 // between. `attempt` is incremented here, at claim time, because it counts
 // real execution attempts — retryStep (below) only resets state, it never
 // touches attempt.
+// Priority aging (#14) and concurrency limits (#12) both land in this one
+// transaction. Aging is a pure ordering change: the candidate SELECT orders by
+// an *effective* priority — `priority + least(maxBoost, age_seconds * rate)`,
+// where `age_seconds = extract(epoch from (now() - run_after))` — so a
+// low-priority step that has been ready long enough climbs past fresh
+// high-priority work instead of starving behind it. With rate 0 (the default)
+// the boost is always 0 and this is exactly `order by priority desc, run_after`.
+//
+// Concurrency is the hard part. A step may carry a `concurrency_key` + `limit`,
+// and is only claimable while fewer than `limit` steps sharing that key are
+// `running`. The naive guard — a correlated `count(*) < limit` in the WHERE —
+// is NOT safe under concurrent claimers: two workers each running this
+// transaction can both read "4 running < 5" (neither sees the other's
+// uncommitted flip-to-running) and both claim, pushing 6 running. We close that
+// race with `pg_advisory_xact_lock(hashtext(key))`: the first worker to reach a
+// given key holds that lock until it commits, so a second worker requesting the
+// same key BLOCKS until the first commits and only then re-counts — and because
+// we run at READ COMMITTED, that post-lock count is a fresh snapshot that sees
+// the first worker's committed flip. Chosen over a per-key counter row because
+// it needs no extra table, self-heals (an xact lock is released on commit/abort
+// even if the worker crashes mid-claim), and serializes only same-key claims —
+// different keys, and the un-keyed fast path, never contend.
+//
+// The candidate SELECT still applies a best-effort `count(*) < limit` filter so
+// a *full* key's steps are skipped in favour of other claimable work (otherwise
+// a full high-priority key would be picked every tick and block everything
+// behind it). That pre-filter can be stale under a race; the advisory-locked
+// recount below is the authority. When the recount finds the key full we claim
+// nothing this tick and the step stays `ready`, retried next poll — never
+// failed or deferred destructively.
 export async function claimNextStep(
   sql: Db,
   options: ClaimStepOptions
 ): Promise<StepRow | undefined> {
+  const rate = options.priorityAgeRatePerSec ?? 0
+  const maxBoost = options.priorityAgeMaxBoost ?? 0
   return withTransaction(sql, async (tx) => {
     const namespaceFilter = options.namespace ? tx`and r.namespace = ${options.namespace}` : tx``
     const candidates = await tx<StepRow[]>`
@@ -562,13 +613,39 @@ export async function claimNextStep(
         and s.run_after <= now()
         and (s.lease_expires_at is null or s.lease_expires_at < now())
         and r.status in ('queued', 'running')
+        and (
+          s.concurrency_key is null
+          or (
+            select count(*) from step rs
+            where rs.concurrency_key = s.concurrency_key and rs.status = 'running'
+          ) < s.concurrency_limit
+        )
         ${namespaceFilter}
-      order by s.priority desc, s.run_after
+      order by
+        (s.priority + least(
+          ${maxBoost}::float8,
+          greatest(0, extract(epoch from (now() - s.run_after)) * ${rate}::float8)
+        )) desc,
+        s.run_after
       for update of s skip locked
       limit 1
     `
     const candidate = candidates[0]
     if (!candidate) return undefined
+
+    // Keyed candidate: serialize per key and re-check the count under the
+    // advisory lock — this is the authoritative gate, the WHERE filter above is
+    // only a best-effort skip of full keys.
+    if (candidate.concurrency_key !== null) {
+      await tx`select pg_advisory_xact_lock(hashtext(${candidate.concurrency_key}))`
+      const counts = await tx<{ running: string }[]>`
+        select count(*)::text as running from step
+        where concurrency_key = ${candidate.concurrency_key} and status = 'running'
+      `
+      const running = Number(counts[0]?.running ?? 0)
+      const limit = candidate.concurrency_limit ?? Number.POSITIVE_INFINITY
+      if (running >= limit) return undefined
+    }
 
     const claimed = await tx<StepRow[]>`
       update step set
@@ -1447,6 +1524,8 @@ export async function startRunForWorkflowName(
       maxAttempts: step.maxAttempts,
       timeoutMs: step.timeoutMs,
       priority: step.priority,
+      concurrencyKey: step.concurrency?.key,
+      concurrencyLimit: step.concurrency?.limit,
       status: step.dependsOn.length === 0 ? 'ready' : 'pending',
     }))
 
