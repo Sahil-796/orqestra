@@ -248,6 +248,61 @@ step — though not, for now, the child run itself.
 
 ---
 
+## Signals & triggers
+
+Phase 5 gives a run ways to *wait for the outside world* and five ways to *be started by it*. The
+engine stops being only a library you call and becomes a service that reacts.
+
+### Waiting for an event
+
+```ts
+const payment = await ctx.waitForEvent('payment.confirmed')
+```
+
+`ctx.waitForEvent` suspends the step durably — exactly like sleep and child-await: the step is
+written to `blocked`, its lease released and its worker freed, and it is woken only when a matching
+event is published. The wait lives on the `step` row (`waiting_event_name` + an optional
+correlation key), so a killed process still resumes when the event arrives. Delivery is
+replay-safe and exactly-once: an `event_seq` counter and stored `event_payloads` mean a resumed
+step returns the same payload it would have the first time, and a given publish wakes each blocked
+step at most once. There is no backlog — a waiter is woken only by events published at or after its
+wait began, and the throw→block race is closed against the step's own DB claim time, so no clock
+skew can lose or double-deliver a signal.
+
+Publish an event from anywhere with `publishSignal(db, { name, correlationKey?, payload? })`.
+
+### Starting a run five ways
+
+An HTTP server (`startServer()`, or `bun run src/server.ts`) is the front door:
+
+| Way in            | How                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| **API trigger**   | `POST /runs` (or `/workflows/:name/runs`) with a JSON `input` — starts a run now      |
+| **Delayed start** | the same call with `runAt` (a timestamp) or `delayMs` — records a one-shot schedule   |
+| **Webhook**       | `POST /webhooks/:name` — durably publishes an event, resuming any `waitForEvent`      |
+| **Signal**        | `POST /signals` — a direct `publishSignal` over HTTP                                  |
+| **Cron / event**  | declared on the workflow, fired by the trigger daemon (below)                         |
+
+All the start and publish paths take an idempotency key (the `Idempotency-Key` header, or a
+webhook delivery id) so a retried request collapses to one run or one event — the same
+exactly-once guarantee the rest of the engine leans on.
+
+Cron and internal-event triggers are declared on the definition:
+
+```ts
+defineWorkflow('nightly-rollup', build, { triggers: [{ type: 'cron', cron: '0 3 * * *' }] })
+defineWorkflow('on-signup', build, { triggers: [{ type: 'event', event: 'user.created' }] })
+```
+
+The **trigger daemon** (`startTriggerRunner({ db, workflows })`) is a poll loop, not a hot loop —
+between ticks it sleeps and releases, the same discipline as the worker. Each tick it claims due
+schedules (`FOR UPDATE SKIP LOCKED`, with a guard bump so two daemons never double-fire) and starts
+their runs — advancing a cron to its next occurrence, disabling a one-shot — and routes freshly
+published events to the workflows that subscribe to them. Cron registration is idempotent across a
+process *restart*, not just within one process, so a redeploy never duplicates a schedule.
+
+---
+
 ## Configuration
 
 Configuration is read from the environment by `src/config.ts`, which fails fast with a clear
@@ -261,6 +316,8 @@ error on malformed input.
 | `ORQ_LEASE_TTL_MS`       | `30000`                                              | How long a claim holds before it is reclaimable |
 | `ORQ_POLL_INTERVAL_MS`   | `200`                                                | Worker sleep after finding the queue empty      |
 | `ORQ_WORKER_CONCURRENCY` | `1`                                                  | Max steps one worker runs at once               |
+| `ORQ_HTTP_HOST`          | `0.0.0.0`                                             | Trigger server bind host                        |
+| `ORQ_HTTP_PORT`          | `3000`                                               | Trigger server bind port                        |
 
 Lease TTL is the tuning knob that matters: too short and healthy long steps get reclaimed
 and double-run; too long and a crashed worker's job stalls. In-flight steps heartbeat to
@@ -293,18 +350,21 @@ critical logic stays unit-testable without a database, and storage stays swappab
 
 ### The data model
 
-Eight tables carry the whole engine.
+The core tables carry the whole engine.
 
 | Table               | Purpose                                                  |
 | ------------------- | -------------------------------------------------------- |
 | `workflow`          | A registered definition and its version                   |
 | `run`               | One execution of a workflow                               |
-| `step`              | The queue and the durable step log, unified               |
-| `signal_wait`       | What a run is blocked on                                  |
-| `event`             | Events that have arrived                                  |
+| `step`              | The queue and the durable step log, unified — plus what a blocked step is waiting for |
+| `events`            | Published signals/events — an append-only log             |
+| `schedules`         | Cron, delayed and one-shot run starts                     |
 | `history`           | Append-only observability spine                           |
 | `dead_letter`       | Runs that exhausted their retries                         |
 | `schema_migrations` | Which migrations have been applied                        |
+
+(The original `signal_wait` and `event` placeholder tables from migration 0001 are superseded —
+a blocked step's event-wait now lives on `step` columns, and the durable event log is `events`.)
 
 Several choices are cheap now and painful to retrofit, so they are in from the start:
 `workflow.version`, so a run started on v1 finishes on v1's logic even after v2 deploys;
@@ -349,11 +409,11 @@ orqestra is under active development and the public API is not stable.
 Built depth-first over nine phases (0–8), 35 features; the authoritative plan is
 [`docs/build-plan.html`](docs/build-plan.html), with per-phase notes in `docs/phase-N.md`.
 
-**Phases 0–4 are done:** the Postgres foundation, durable execution with crash recovery, the
+**Phases 0–5 are done:** the Postgres foundation, durable execution with crash recovery, the
 claim queue with expiring leases and concurrent workers, execution control (sleep, timeouts,
-cancellation), and orchestration (dependencies, fan-out/fan-in, conditional branching, child
-workflows).
+cancellation), orchestration (dependencies, fan-out/fan-in, conditional branching, child
+workflows), and signals & triggers (`ctx.waitForEvent`, plus API, event, cron, delayed and
+webhook starts).
 
-**Next is Phase 5 — signals & triggers:** `ctx.waitForEvent`, plus API, event, cron, delayed
-and webhook triggers. Phases 6–8 cover flow control at scale, failure handling, and
-observability.
+**Next is Phase 6 — flow control at scale:** concurrency limits, rate limiting and priorities,
+where Redis first earns a place. Phases 7–8 cover failure handling and observability.
