@@ -12,6 +12,10 @@ export interface OrqConfig {
   pollIntervalMs: number
   /** Default max steps a single worker runs at once. */
   workerConcurrency: number
+  /** HTTP trigger server bind host. */
+  httpHost: string
+  /** HTTP trigger server bind port. */
+  httpPort: number
 }
 
 const DEFAULT_DATABASE_URL = 'postgres://orqestra:orqestra@localhost:5433/orqestra'
@@ -20,6 +24,8 @@ const DEFAULT_LOG_LEVEL: LogLevel = 'info'
 const DEFAULT_LEASE_TTL_MS = 30_000
 const DEFAULT_POLL_INTERVAL_MS = 200
 const DEFAULT_WORKER_CONCURRENCY = 1
+const DEFAULT_HTTP_HOST = '0.0.0.0'
+const DEFAULT_HTTP_PORT = 3000
 
 const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error']
 
@@ -71,6 +77,20 @@ function parseWorkerConcurrency(raw: string | undefined): number {
   return n
 }
 
+function parseHttpHost(raw: string | undefined): string {
+  if (raw === undefined || raw === '') return DEFAULT_HTTP_HOST
+  return raw
+}
+
+function parseHttpPort(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return DEFAULT_HTTP_PORT
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0 || n > 65535) {
+    throw new Error(`ORQ_HTTP_PORT must be an integer in 0..65535, got: ${raw}`)
+  }
+  return n
+}
+
 function parseDatabaseUrl(raw: string | undefined): string {
   const url = raw && raw !== '' ? raw : DEFAULT_DATABASE_URL
   try {
@@ -90,5 +110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): OrqConfig {
     leaseTtlMs: parseLeaseTtlMs(env.ORQ_LEASE_TTL_MS),
     pollIntervalMs: parsePollIntervalMs(env.ORQ_POLL_INTERVAL_MS),
     workerConcurrency: parseWorkerConcurrency(env.ORQ_WORKER_CONCURRENCY),
+    httpHost: parseHttpHost(env.ORQ_HTTP_HOST),
+    httpPort: parseHttpPort(env.ORQ_HTTP_PORT),
   }
 }

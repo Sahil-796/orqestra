@@ -74,6 +74,34 @@ describe('syncCronSchedules', () => {
     expect(second.skipped).toBe(1)
   })
 
+  test('is idempotent across a process restart: the durable DB check prevents a duplicate cron row', async () => {
+    const workflowName = uniqueName('wf-cron-sync-restart')
+    const handle = defineWorkflow(
+      workflowName,
+      (b) => {
+        b.step('only', async () => 'ok')
+      },
+      { triggers: [{ type: 'cron', cron: '15 * * * *' }] }
+    )
+    await handle.register(sql)
+
+    const first = await syncCronSchedules(sql, [handle])
+    expect(first.created.length).toBe(1)
+
+    // Simulate a fresh process: the in-memory guard is empty again, so the only
+    // thing standing between us and a duplicate cron row is findCronSchedule.
+    __resetCronSyncGuardForTests()
+    const afterRestart = await syncCronSchedules(sql, [handle])
+    expect(afterRestart.created.length).toBe(0)
+    expect(afterRestart.skipped).toBe(1)
+
+    const rows = await sql<{ count: number }[]>`
+      select count(*)::int as count from schedules
+      where workflow_name = ${workflowName} and kind = 'cron' and enabled
+    `
+    expect(rows[0]!.count).toBe(1)
+  })
+
   test('a workflow with no cron trigger is left alone', async () => {
     const workflowName = uniqueName('wf-no-cron')
     const handle = defineWorkflow(workflowName, (b) => {

@@ -1287,6 +1287,28 @@ export async function getSchedule(sql: Db, id: string): Promise<ScheduleRow | un
   return rows[0]
 }
 
+// Durable existence check for a workflow's cron schedule. syncCronSchedules
+// uses this to stay idempotent across process *restarts*: its in-memory guard
+// only covers the current process, so without a persisted check a fresh process
+// would insert a second cron row for the same workflow+expression and the
+// schedule would fire twice. Matches on the enabled cron row only.
+export async function findCronSchedule(
+  sql: Db,
+  workflowName: string,
+  cronExpression: string
+): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    select * from schedules
+    where kind = 'cron'
+      and enabled
+      and workflow_name = ${workflowName}
+      and cron_expression = ${cronExpression}
+    order by created_at
+    limit 1
+  `
+  return rows[0]
+}
+
 // The poller's atomic claim. Returns due, enabled schedules and, in the same
 // statement, pushes their `next_run_at` forward by `guardMs` so a second
 // poller (or the same poller on its next tick, before this batch has been

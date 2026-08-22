@@ -7,7 +7,7 @@ import { migrate } from './store/migrate.ts'
 import * as repositories from './store/repositories.ts'
 import { cancelRun, type CancelResult } from './control/cancel.ts'
 
-export { defineWorkflow, getRegisteredWorkflow } from './define/workflow.ts'
+export { defineWorkflow, getRegisteredWorkflow, getWorkflowTriggers } from './define/workflow.ts'
 export type { WorkflowBuilder, WorkflowHandle, StepFn, StepOptions } from './define/workflow.ts'
 export type { WorkflowContext } from './define/context.ts'
 export { createWorkflowContext } from './define/context.ts'
@@ -50,6 +50,30 @@ export type { Worker, WorkerOptions } from './worker/worker.ts'
 
 export { cancelRun, isRunCancelled, sweepCancelledRuns } from './control/cancel.ts'
 export type { CancelResult } from './control/cancel.ts'
+
+// Phase 5 — Signals & triggers. Runs pause on ctx.waitForEvent and resume when
+// an event is published; they also start five ways — direct API call, internal
+// event, cron, a future timestamp, or an inbound webhook.
+export { publishSignal } from './control/signal.ts'
+export type { PublishSignalInput, PublishSignalResult } from './control/signal.ts'
+export { startRun as startRunByName, scheduleRun } from './control/start.ts'
+export type { StartRunInput, ScheduleRunInput } from './control/start.ts'
+
+export { startServer } from './server.ts'
+export type { StartServerOptions } from './server.ts'
+export { createTriggerHandler } from './triggers/http.ts'
+export { mapWebhookToEvent } from './triggers/webhook.ts'
+
+export { startTriggerRunner, runTriggerTick } from './triggers/runner.ts'
+export type { TriggerRunner, TriggerRunnerOptions, TriggerTickResult } from './triggers/runner.ts'
+export { pollDueSchedules } from './triggers/scheduled.ts'
+export { pollUndispatchedEvents, eventTriggerIdempotencyKey } from './triggers/events.ts'
+export {
+  computeNextRun,
+  validateCronExpression,
+  parseCronExpression,
+  syncCronSchedules,
+} from './triggers/cron.ts'
 
 export type { OrqConfig, LogLevel } from './config.ts'
 export { loadConfig } from './config.ts'

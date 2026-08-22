@@ -13,20 +13,19 @@ export interface StartServerOptions {
 }
 
 /**
- * Start the HTTP trigger server. Defaults the port to `PORT` (falling back to
- * 3000) — there's no dedicated ORQ_* server env var yet, since config.ts owns
- * the DB/worker knobs and this is a new, separate concern.
+ * Start the HTTP trigger server. Host/port come from config
+ * (`ORQ_HTTP_HOST` / `ORQ_HTTP_PORT`, defaulting to 0.0.0.0:3000) and can be
+ * overridden per-call via options.
  */
 export function startServer(options: StartServerOptions = {}) {
-  // Loading config here (even though only databaseUrl is used indirectly via
-  // getDb()) keeps this file consistent with the rest of src/: fail fast on
-  // bad env before accepting any traffic.
-  loadConfig()
+  // Load config first so bad env fails fast before we accept any traffic, and
+  // so host/port follow the same fail-fast parsing as the DB/worker knobs.
+  const config = loadConfig()
   const db = getDb()
   const handler = createTriggerHandler({ db })
 
-  const port = options.port ?? (process.env.PORT ? Number(process.env.PORT) : 3000)
-  const hostname = options.hostname ?? process.env.HOST ?? '0.0.0.0'
+  const port = options.port ?? config.httpPort
+  const hostname = options.hostname ?? config.httpHost
 
   return Bun.serve({
     port,

@@ -18,7 +18,7 @@
 // restricted, every day matches.
 
 import type { WorkflowHandle } from '../define/workflow.ts'
-import { createSchedule, type ScheduleRow } from '../store/repositories.ts'
+import { createSchedule, findCronSchedule, type ScheduleRow } from '../store/repositories.ts'
 import type { Db } from '../store/client.ts'
 
 interface FieldRange {
@@ -223,6 +223,18 @@ export async function syncCronSchedules(
       }
 
       validateCronExpression(trigger.cron)
+
+      // Durable dedup: the in-memory guard above only covers this process, so a
+      // fresh process must ask the DB whether an enabled cron row already
+      // exists before creating one — otherwise a restart double-registers the
+      // schedule and it fires twice.
+      const existing = await findCronSchedule(sql, workflow.name, trigger.cron)
+      if (existing) {
+        syncedCronKeys.add(key)
+        skipped++
+        continue
+      }
+
       const nextRunAt = computeNextRun(trigger.cron, now)
       const row = await createSchedule(sql, {
         workflowName: workflow.name,
