@@ -20,6 +20,7 @@ import {
   lockRun,
   markStepReady,
   markStepRunning,
+  registerStepEventWait,
   resetRunningSteps,
   skipStep,
   updateRunStatus,
@@ -31,6 +32,7 @@ import { decodeResult, serializeError, type RunStatus } from '../types.ts'
 import { createWorkflowContext, getSkipRequests } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { createLogger } from '../observability/logger.ts'
+import { isEventWaitSignal } from './event.ts'
 import { wakeParentAwaiting } from './dag.ts'
 import { isRunComplete, newlyReadySteps } from './scheduler.ts'
 
@@ -164,6 +166,17 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
 
     const readySteps = steps.filter((s) => s.status === 'ready')
     if (readySteps.length === 0) {
+      // #18: a step suspended on `ctx.waitForEvent` sits in `blocked` with no
+      // ready siblings — the run is not stuck, it is parked until a matching
+      // event is published. Return without finalizing; a later resumeRun
+      // (after the event lands and the step is back to `ready`) continues it.
+      // This is the inline-driver analogue of the worker parking the step and
+      // giving its slot back. (The inline driver still cannot itself PUBLISH
+      // the event mid-loop — it is single-process and sequential — so the
+      // publish must come from outside, then resumeRun.)
+      if (steps.some((s) => s.status === 'blocked')) {
+        return { runId, status: 'running' }
+      }
       // A well-formed DAG always has something ready or completed; getting
       // here means every remaining step is blocked on a dep that will
       // never complete (e.g. a cycle, or a dep name typo) — surface it
@@ -215,7 +228,15 @@ async function runStep(
     return { runId: run.id, status: 'failed' }
   }
 
-  const ctx = createWorkflowContext({ runId: run.id, input: run.input, stepId: step.id })
+  const ctx = createWorkflowContext({
+    runId: run.id,
+    input: run.input,
+    stepId: step.id,
+    // #18: replay an already-satisfied waitForEvent from its delivered
+    // payload rather than re-suspending. Set once a prior wait was woken.
+    eventSeq: step.event_seq,
+    eventPayloads: step.event_payloads,
+  })
 
   // Run the user function OUTSIDE a transaction (it may be slow / call out
   // to the world); only the persistence of its outcome is atomic.
@@ -251,6 +272,32 @@ async function runStep(
     })
     return undefined
   } catch (e) {
+    // #18: an event-wait is control flow, not a failure. Park the step in
+    // `blocked` (no lease to fence in this single-process path) and stop
+    // driving the run — executeRun's caller resumes it after the event is
+    // published. Unlike the worker path there is no throw->block race to
+    // backstop here: nothing else is executing, so any publish that has
+    // already landed will be picked up by the wake + the resumeRun that
+    // follows it.
+    if (isEventWaitSignal(e)) {
+      await withTransaction(db, async (tx) => {
+        const blocked = await registerStepEventWait(tx, {
+          stepId: step.id,
+          eventName: e.eventName,
+          correlationKey: e.correlationKey,
+        })
+        if (blocked) {
+          await insertHistory(tx, {
+            runId: run.id,
+            stepId: step.id,
+            type: 'step.waiting_for_event',
+            data: { event: e.eventName, correlationKey: e.correlationKey ?? null, seq: e.seq },
+          })
+        }
+      })
+      return { runId: run.id, status: 'running' }
+    }
+
     const error = serializeError(e)
     await withTransaction(db, async (tx) => {
       await failStep(tx, step.id, error)
