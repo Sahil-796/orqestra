@@ -14,7 +14,7 @@
 
 import type { Db } from '../store/client.ts'
 import { getWorkflowByName, insertWorkflow, type WorkflowRow } from '../store/repositories.ts'
-import type { StepDefinition, WorkflowDefinition } from '../types.ts'
+import type { StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
 import type { WorkflowContext } from './context.ts'
 
 export type StepFn<T = unknown> = (ctx: WorkflowContext) => Promise<T>
@@ -96,11 +96,24 @@ export class WorkflowBuilder {
   }
 }
 
+/** Options for `defineWorkflow` beyond the step builder. */
+export interface WorkflowOptions {
+  /**
+   * Declarative event/cron triggers (Phase 5). Data only — declaring a
+   * trigger implements nothing here; the trigger daemon (Agent 3) reads them
+   * (via `handle.triggers` / `getWorkflowTriggers`) and starts runs of this
+   * workflow when a trigger fires. A workflow may carry several.
+   */
+  triggers?: WorkflowTrigger[]
+}
+
 export interface WorkflowHandle {
   readonly name: string
   readonly definition: WorkflowDefinition
   /** Step implementations, keyed by step name — for the Phase 1+ executor. */
   readonly stepFns: Map<string, StepFn>
+  /** Declarative triggers this workflow was defined with (Phase 5). Empty if none. */
+  readonly triggers: readonly WorkflowTrigger[]
   /**
    * Persist this DAG to Postgres. If an identical DAG is already the latest
    * registered version, this is a no-op; otherwise a new version is
@@ -132,7 +145,8 @@ function dagsEqual(a: WorkflowDefinition, b: WorkflowDefinition): boolean {
 
 export function defineWorkflow(
   name: string,
-  builderFn: (builder: WorkflowBuilder) => void
+  builderFn: (builder: WorkflowBuilder) => void,
+  options: WorkflowOptions = {}
 ): WorkflowHandle {
   const builder = new WorkflowBuilder()
   builderFn(builder)
@@ -141,11 +155,13 @@ export function defineWorkflow(
   const stepFns = builder.buildStepFns()
 
   const definition: WorkflowDefinition = { name, version: 1, steps }
+  const triggers: readonly WorkflowTrigger[] = options.triggers ?? []
 
   const handle: WorkflowHandle = {
     name,
     definition,
     stepFns,
+    triggers,
     async register(sql: Db): Promise<WorkflowRow> {
       const latest = await getWorkflowByName(sql, name)
       if (latest && dagsEqual(latest.dag, definition)) {
@@ -163,4 +179,14 @@ export function defineWorkflow(
 /** Look up a workflow previously declared with defineWorkflow in this process. */
 export function getRegisteredWorkflow(name: string): WorkflowHandle | undefined {
   return registry.get(name)
+}
+
+/**
+ * The declarative triggers a workflow was defined with (Phase 5) — the
+ * trigger daemon (Agent 3) reads these to know which workflows to start on an
+ * event or a cron tick. Empty array for a workflow with no triggers, or one
+ * not registered in this process.
+ */
+export function getWorkflowTriggers(name: string): readonly WorkflowTrigger[] {
+  return registry.get(name)?.triggers ?? []
 }

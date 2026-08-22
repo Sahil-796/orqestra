@@ -17,10 +17,8 @@
 // Recording these for true deterministic replay is a future refinement.
 
 import { SleepSignal, parseDuration } from '../engine/sleep.ts'
-
-function notImplemented(feature: string, phase: string): never {
-  throw new Error(`ctx.${feature} is not implemented yet (lands in ${phase})`)
-}
+import { EventWaitSignal } from '../engine/event.ts'
+import type { WaitForEventOptions } from '../types.ts'
 
 // A signal that is never aborted — the default when no timeout/cancellation
 // is wired in, so `ctx.signal` is always a real AbortSignal and callers never
@@ -113,8 +111,22 @@ export interface WorkflowContext {
    */
   sleep(duration: string | number): Promise<void>
 
-  /** Suspend the run until a named event arrives. Phase 5. */
-  waitForEvent<T = unknown>(eventKey: string): Promise<T>
+  /**
+   * Suspend the step until a matching event is published (#18). Resolves with
+   * the event's payload. Backed by the same suspend-into-`blocked` + replay
+   * machinery as `sleep`/child-await: the step throws an `EventWaitSignal`,
+   * the worker parks it (`registerStepEventWait`) and releases the slot, and a
+   * matching `publishEvent` wakes it — no worker, connection, or timer is held
+   * while it waits. `opts.correlationKey` narrows the wait to events carrying
+   * that same correlation value; omit it to be woken by any event of `name`.
+   *
+   * Replay note (same shape as `sleep`): a woken step re-runs from the top, so
+   * an already-served wait resolves immediately from its delivered payload
+   * rather than suspending again — code before the wait runs again on each
+   * resume, so derive anything that must survive a wait from `ctx.input`, not
+   * from `now()`/`random()`.
+   */
+  waitForEvent<T = unknown>(name: string, opts?: WaitForEventOptions): Promise<T>
 
   /**
    * Feature #17, conditional branching: declare that the named sibling
@@ -159,14 +171,23 @@ export function createWorkflowContext(input: {
   input: unknown
   /** How many sleeps this step has already served (step.sleep_seq). Default 0. */
   sleepSeq?: number
+  /** How many event-waits this step has already served (step.event_seq). Default 0. */
+  eventSeq?: number
+  /** Payloads delivered to already-served event-waits, in seq order (step.event_payloads). */
+  eventPayloads?: readonly unknown[]
   /** Aborted on step timeout or run cancellation. Default: a never-aborted signal. */
   signal?: AbortSignal
   /** The step row this context runs for. Read back via `getContextStepId`. */
   stepId?: string
 }): WorkflowContext {
   const alreadyServed = input.sleepSeq ?? 0
+  const eventsAlreadyServed = input.eventSeq ?? 0
+  const eventPayloads = input.eventPayloads ?? []
   // Per-context (i.e. per-execution) counter of ctx.sleep() calls made so far.
   let sleepCalls = 0
+  // Same, for ctx.waitForEvent() — independent of sleepCalls so a step that
+  // interleaves sleeps and event-waits replays each on its own counter.
+  let eventCalls = 0
   const skipRequests: string[] = []
 
   const ctx: WorkflowContext = {
@@ -187,7 +208,13 @@ export function createWorkflowContext(input: {
         seq,
       })
     },
-    waitForEvent: () => notImplemented('waitForEvent()', 'Phase 5'),
+    waitForEvent: async <T = unknown>(name: string, opts?: WaitForEventOptions): Promise<T> => {
+      const seq = ++eventCalls
+      // Already served on a previous execution: return the payload that woke
+      // it, not a fresh suspension. Mirrors sleep's `seq <= alreadyServed`.
+      if (seq <= eventsAlreadyServed) return eventPayloads[seq - 1] as T
+      throw new EventWaitSignal({ eventName: name, correlationKey: opts?.correlationKey, seq })
+    },
     skip: (...stepNames: string[]): void => {
       for (const name of stepNames) {
         if (!skipRequests.includes(name)) skipRequests.push(name)
