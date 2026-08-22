@@ -91,6 +91,11 @@ async function registerAndCreateRun(
     maxAttempts: step.maxAttempts,
     timeoutMs: step.timeoutMs,
     priority: step.priority,
+    concurrencyKey: step.concurrency?.key,
+    concurrencyLimit: step.concurrency?.limit,
+    rateKey: step.rateLimit?.key,
+    rateLimit: step.rateLimit?.limit,
+    rateWindowMs: step.rateLimit?.windowMs,
     status: step.dependsOn.length === 0 ? 'ready' : 'pending',
   }))
 

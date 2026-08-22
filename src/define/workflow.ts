@@ -14,8 +14,9 @@
 
 import type { Db } from '../store/client.ts'
 import { getWorkflowByName, insertWorkflow, type WorkflowRow } from '../store/repositories.ts'
-import type { ConcurrencyLimit, StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
+import type { ConcurrencyLimit, RateLimit, StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
 import { validateConcurrency } from '../control/concurrency.ts'
+import { validateRateLimit } from '../control/ratelimit.ts'
 import type { WorkflowContext } from './context.ts'
 
 export type StepFn<T = unknown> = (ctx: WorkflowContext) => Promise<T>
@@ -32,6 +33,13 @@ export interface StepOptions {
    * case. `limit` must be a positive integer, or `defineWorkflow` throws.
    */
   concurrency?: ConcurrencyLimit
+  /**
+   * Rate cap for this step (#13): at most `limit` steps sharing `key` may
+   * *start* per `windowMs` window, across every run. Omit for the unlimited
+   * common case. `limit` and `windowMs` must be positive integers, or
+   * `defineWorkflow` throws.
+   */
+  rateLimit?: RateLimit
 }
 
 export class WorkflowBuilder {
@@ -52,6 +60,7 @@ export class WorkflowBuilder {
       timeoutMs: options.timeoutMs,
       priority: options.priority ?? 0,
       concurrency: validateConcurrency(name, options.concurrency),
+      rateLimit: validateRateLimit(name, options.rateLimit),
     })
     return this
   }
@@ -142,6 +151,9 @@ function stepsEqual(a: StepDefinition, b: StepDefinition): boolean {
     a.priority === b.priority &&
     (a.concurrency?.key ?? null) === (b.concurrency?.key ?? null) &&
     (a.concurrency?.limit ?? null) === (b.concurrency?.limit ?? null) &&
+    (a.rateLimit?.key ?? null) === (b.rateLimit?.key ?? null) &&
+    (a.rateLimit?.limit ?? null) === (b.rateLimit?.limit ?? null) &&
+    (a.rateLimit?.windowMs ?? null) === (b.rateLimit?.windowMs ?? null) &&
     a.dependsOn.length === b.dependsOn.length &&
     a.dependsOn.every((dep, i) => dep === b.dependsOn[i])
   )

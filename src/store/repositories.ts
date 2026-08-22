@@ -56,6 +56,11 @@ export interface StepRow {
   // claim query is self-contained. Both null = unlimited (the common case).
   concurrency_key: string | null
   concurrency_limit: number | null
+  // Phase 6 (#13): declared rate cap, persisted onto the row so the claim query
+  // is self-contained. All three null = unlimited (the common case).
+  rate_key: string | null
+  rate_limit: number | null
+  rate_window_ms: number | null
   reclaim_count: number
   sleep_seq: number
   sleeping_until: Date | null
@@ -349,6 +354,12 @@ export interface NewStep {
   // (0006_flow_control.sql) rejects a half-declared pair.
   concurrencyKey?: string
   concurrencyLimit?: number
+  // Phase 6 (#13): optional rate cap. All omitted = unlimited. When present they
+  // must agree (key + positive limit + positive window) — the DB CHECK
+  // (0007_rate_limiting.sql) rejects a partially-declared triple.
+  rateKey?: string
+  rateLimit?: number
+  rateWindowMs?: number
 }
 
 export async function insertSteps(sql: Db, runId: string, steps: NewStep[]): Promise<StepRow[]> {
@@ -362,6 +373,9 @@ export async function insertSteps(sql: Db, runId: string, steps: NewStep[]): Pro
     priority: step.priority,
     concurrency_key: step.concurrencyKey ?? null,
     concurrency_limit: step.concurrencyLimit ?? null,
+    rate_key: step.rateKey ?? null,
+    rate_limit: step.rateLimit ?? null,
+    rate_window_ms: step.rateWindowMs ?? null,
     depends_on: step.dependsOn,
   }))
   return sql<StepRow[]>`
@@ -598,6 +612,24 @@ export interface ClaimStepOptions {
 // recount below is the authority. When the recount finds the key full we claim
 // nothing this tick and the step stays `ready`, retried next poll — never
 // failed or deferred destructively.
+//
+// Rate limiting (#13) is the third gate to land here, and it uses the same
+// advisory-lock serialization as concurrency but a different window model and a
+// different "budget exhausted" response. A step may carry a `rate_key` + `limit`
+// + `window_ms`: at most `limit` steps sharing that key may START within any one
+// fixed window. We take `pg_advisory_xact_lock(hashtext(rate_key))` (so
+// count-and-consume is atomic per key — two workers can't both see budget and
+// both consume it), then upsert-increment the (rate_key, window_start) counter
+// in `rate_window`, where `window_start = floor(now_ms / window_ms) * window_ms`
+// against the DB clock (mirrored by control/ratelimit.ts's windowStartMs). The
+// conditional ON CONFLICT ... WHERE count < limit makes the whole check atomic:
+// it returns a row iff budget remained. If budget is EXHAUSTED we do NOT claim
+// this tick and, unlike concurrency (where the step stays plainly `ready` and is
+// retried on the next poll), we DEFER the step — push its `run_after` to the
+// next window boundary — so the worker doesn't hot-spin re-checking a step whose
+// key can't grant a start until the window rolls over. The step is never lost or
+// failed; it simply becomes claimable again when fresh budget exists.
+// Null rate key = unlimited: the un-keyed fast path never touches rate_window.
 export async function claimNextStep(
   sql: Db,
   options: ClaimStepOptions
@@ -645,6 +677,49 @@ export async function claimNextStep(
       const running = Number(counts[0]?.running ?? 0)
       const limit = candidate.concurrency_limit ?? Number.POSITIVE_INFINITY
       if (running >= limit) return undefined
+    }
+
+    // Keyed by a rate limit: serialize per key, then count-and-consume the
+    // current window's budget under the advisory lock. Runs AFTER the
+    // concurrency gate on purpose — the concurrency check has no side effect, so
+    // a step blocked by a full concurrency key must not have burned a rate token
+    // it never got to use. Consuming here is the authoritative "this start
+    // happened"; if the window is exhausted we defer instead of claiming.
+    if (
+      candidate.rate_key !== null &&
+      candidate.rate_limit !== null &&
+      candidate.rate_window_ms !== null
+    ) {
+      const rateKey = candidate.rate_key
+      const rateLimit = candidate.rate_limit
+      const windowMs = candidate.rate_window_ms
+      await tx`select pg_advisory_xact_lock(hashtext(${rateKey}))`
+      const consumed = await tx<{ count: number }[]>`
+        insert into rate_window (rate_key, window_start, count)
+        values (
+          ${rateKey},
+          (floor(extract(epoch from now()) * 1000 / ${windowMs}) * ${windowMs})::bigint,
+          1
+        )
+        on conflict (rate_key, window_start) do update
+          set count = rate_window.count + 1
+          where rate_window.count < ${rateLimit}
+        returning count
+      `
+      if (!consumed[0]) {
+        // Window exhausted: defer to the next window boundary (DB clock, mirrors
+        // ratelimit.ts's nextWindowStartMs) so this step isn't re-checked every
+        // poll until fresh budget exists. Not failed, not lost — just not now.
+        await tx`
+          update step set
+            run_after = to_timestamp(
+              (floor(extract(epoch from now()) * 1000 / ${windowMs}) + 1) * ${windowMs} / 1000.0
+            ),
+            updated_at = now()
+          where id = ${candidate.id}
+        `
+        return undefined
+      }
     }
 
     const claimed = await tx<StepRow[]>`
@@ -1526,6 +1601,9 @@ export async function startRunForWorkflowName(
       priority: step.priority,
       concurrencyKey: step.concurrency?.key,
       concurrencyLimit: step.concurrency?.limit,
+      rateKey: step.rateLimit?.key,
+      rateLimit: step.rateLimit?.limit,
+      rateWindowMs: step.rateLimit?.windowMs,
       status: step.dependsOn.length === 0 ? 'ready' : 'pending',
     }))
 

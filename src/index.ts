@@ -83,8 +83,12 @@ export {
 export { validateConcurrency, isConcurrencyLimited } from './control/concurrency.ts'
 export { effectivePriority, ageBoost } from './control/priority.ts'
 export type { PriorityAgingConfig } from './control/priority.ts'
-// `ConcurrencyLimit` (the step-declaration type) is already re-exported via
-// `export * from './types.ts'` below.
+// Rate limiting (#13): a step declares a rate key + limit + window and the claim
+// query enforces "at most N starts per window for this key" atomically under a
+// flood of concurrent claims, deferring exhausted steps to the next window.
+export { validateRateLimit, isRateLimited, windowStartMs, nextWindowStartMs } from './control/ratelimit.ts'
+// `ConcurrencyLimit` and `RateLimit` (the step-declaration types) are already
+// re-exported via `export * from './types.ts'` below.
 
 export type { OrqConfig, LogLevel } from './config.ts'
 export { loadConfig } from './config.ts'

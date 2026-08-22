@@ -91,6 +91,21 @@ export interface ConcurrencyLimit {
   limit: number
 }
 
+// Rate limiting (#13): at most `limit` steps sharing `key` may *start* within
+// any one fixed `windowMs` window, across all runs. Distinct from concurrency
+// (#12): concurrency caps how many run *at once*, rate limiting caps how many
+// *start per window*. Enforced in the claim query (repositories.ts
+// `claimNextStep`) under a per-key advisory lock, with window math + validation
+// helpers in control/ratelimit.ts. A step with no `rateLimit` is unlimited.
+export interface RateLimit {
+  /** Steps sharing this key contend for the same window budget, across all runs. */
+  key: string
+  /** Max starts allowed per window. Must be >= 1. */
+  limit: number
+  /** Window length in milliseconds. Must be >= 1. */
+  windowMs: number
+}
+
 export interface StepDefinition {
   name: string
   dependsOn: string[]
@@ -99,6 +114,8 @@ export interface StepDefinition {
   priority: number
   /** Concurrency cap for this step (#12). Absent = unlimited. */
   concurrency?: ConcurrencyLimit
+  /** Rate cap for this step (#13). Absent = unlimited. */
+  rateLimit?: RateLimit
 }
 
 export interface WorkflowDefinition {
