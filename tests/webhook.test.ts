@@ -59,13 +59,22 @@ describe('mapWebhookToEvent', () => {
     expect(mapped.idempotencyKey).toBe('wh-id')
   })
 
-  test('idempotency key falls back to a body id when no header is present', () => {
+  test('idempotency key falls back to an explicit body idempotencyKey', () => {
     const mapped = mapWebhookToEvent({
       routeName: 'orders',
-      body: { id: 'body-id' },
+      body: { idempotencyKey: 'body-key' },
       headers: {},
     })
-    expect(mapped.idempotencyKey).toBe('body-id')
+    expect(mapped.idempotencyKey).toBe('body-key')
+  })
+
+  test('a body id/eventId is NOT used as an idempotency key (it is usually a resource id, not a delivery id, so deduping on it would silently drop distinct deliveries about the same resource)', () => {
+    const mapped = mapWebhookToEvent({
+      routeName: 'orders',
+      body: { id: 'body-id', eventId: 'evt-id' },
+      headers: {},
+    })
+    expect(mapped.idempotencyKey).toBeUndefined()
   })
 
   test('no idempotency key when nothing usable is present', () => {
