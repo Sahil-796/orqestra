@@ -91,6 +91,16 @@ function idempotencyKeyFrom(req: Request, body: Record<string, unknown>): string
   return stringOrUndefined(req.headers.get('idempotency-key') ?? undefined) ?? stringOrUndefined(body.idempotencyKey)
 }
 
+// decodeURIComponent throws URIError on a malformed %-escape; a bad path
+// segment is a client error (400), not a server crash (500).
+function safeDecodeSegment(raw: string): string | undefined {
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return undefined
+  }
+}
+
 // ---- POST /workflows/:name/runs (and its alias POST /runs) ----------------
 //
 // #21 API trigger + #24 delayed-start request. A future `runAt`/`delayMs`
@@ -279,8 +289,8 @@ export function createTriggerHandler(deps: TriggerServerDeps): (req: Request) =>
     const runsMatch = WORKFLOW_RUNS_RE.exec(path)
     if (runsMatch) {
       if (req.method !== 'POST') return methodNotAllowed()
-      const workflowName = decodeURIComponent(runsMatch[1] ?? '')
-      if (workflowName.length === 0) return badRequest('workflow name is required')
+      const workflowName = safeDecodeSegment(runsMatch[1] ?? '')
+      if (workflowName === undefined || workflowName.length === 0) return badRequest('workflow name is required')
       const parsed = await parseJsonBody(req)
       if (!parsed.ok) return badRequest(parsed.error)
       const body = parsed.body === undefined ? {} : parsed.body
@@ -291,7 +301,8 @@ export function createTriggerHandler(deps: TriggerServerDeps): (req: Request) =>
     const webhookMatch = WEBHOOK_RE.exec(path)
     if (webhookMatch) {
       if (req.method !== 'POST') return methodNotAllowed()
-      const routeName = decodeURIComponent(webhookMatch[1] ?? '')
+      const routeName = safeDecodeSegment(webhookMatch[1] ?? '')
+      if (routeName === undefined || routeName.length === 0) return badRequest('webhook name is required')
       return handleWebhook(req, db, routeName)
     }
 

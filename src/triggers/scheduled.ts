@@ -58,6 +58,11 @@ export async function pollDueSchedules(
         input: schedule.input,
         namespace: schedule.namespace,
         priority: schedule.priority,
+        // #24: a one-shot must start at most once even if a crash after start (but
+        // before markScheduleFired) lets the guard-bumped row become due again. A
+        // 'cron' row is intentionally left keyless — it is a repeating schedule and
+        // an occasional at-least-once fire on crash is acceptable.
+        idempotencyKey: schedule.kind === 'once' ? `schedule-once:${schedule.id}` : undefined,
       })
       result.started++
 

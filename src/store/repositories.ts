@@ -1229,6 +1229,14 @@ export async function getUndispatchedEvents(sql: Db, limit = 100): Promise<Event
   `
 }
 
+// Undo a dispatch stamp so a later poll re-claims the event. Used when routing
+// a claimed event to its workflows partially failed: resetting dispatched_at
+// lets the next tick retry, and the per-(event, workflow) idempotency key keeps
+// already-started workflows from starting twice.
+export async function resetEventDispatch(sql: Db, eventId: string): Promise<void> {
+  await sql`update events set dispatched_at = null where id = ${eventId}`
+}
+
 // ---- schedules: time-based starts (Agents 2 & 3) --------------------------
 
 export interface ScheduleRow {
@@ -1422,29 +1430,29 @@ export async function startRunForWorkflowName(
     throw new Error(`startRunForWorkflowName: no workflow registered under name "${input.workflowName}"`)
   }
 
-  const { run, created } = await createRun(sql, {
-    workflowId: workflow.id,
-    namespace: input.namespace,
-    priority: input.priority,
-    input: input.input,
-    idempotencyKey: input.idempotencyKey,
-  })
+  return withTransaction(sql, async (tx) => {
+    const { run, created } = await createRun(tx, {
+      workflowId: workflow.id,
+      namespace: input.namespace,
+      priority: input.priority,
+      input: input.input,
+      idempotencyKey: input.idempotencyKey,
+    })
 
-  if (!created) return { runId: run.id, workflowId: workflow.id, created: false }
+    if (!created) return { runId: run.id, workflowId: workflow.id, created: false }
 
-  const steps: NewStep[] = workflow.dag.steps.map((step) => ({
-    name: step.name,
-    dependsOn: step.dependsOn,
-    maxAttempts: step.maxAttempts,
-    timeoutMs: step.timeoutMs,
-    priority: step.priority,
-    status: step.dependsOn.length === 0 ? 'ready' : 'pending',
-  }))
+    const steps: NewStep[] = workflow.dag.steps.map((step) => ({
+      name: step.name,
+      dependsOn: step.dependsOn,
+      maxAttempts: step.maxAttempts,
+      timeoutMs: step.timeoutMs,
+      priority: step.priority,
+      status: step.dependsOn.length === 0 ? 'ready' : 'pending',
+    }))
 
-  await withTransaction(sql, async (tx) => {
     await insertSteps(tx, run.id, steps)
     await insertHistory(tx, { runId: run.id, type: 'run.created', data: { input: input.input } })
-  })
 
-  return { runId: run.id, workflowId: workflow.id, created: true }
+    return { runId: run.id, workflowId: workflow.id, created: true }
+  })
 }

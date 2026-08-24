@@ -11,6 +11,7 @@ import {
   completeStep,
   createRun,
   failStep,
+  findMatchingEventSince,
   getIncompleteRuns,
   getRun,
   getStepsByRun,
@@ -24,6 +25,7 @@ import {
   resetRunningSteps,
   skipStep,
   updateRunStatus,
+  wakeStepsWaitingForEvent,
   type NewStep,
   type RunRow,
   type StepRow,
@@ -275,10 +277,10 @@ async function runStep(
     // #18: an event-wait is control flow, not a failure. Park the step in
     // `blocked` (no lease to fence in this single-process path) and stop
     // driving the run — executeRun's caller resumes it after the event is
-    // published. Unlike the worker path there is no throw->block race to
-    // backstop here: nothing else is executing, so any publish that has
-    // already landed will be picked up by the wake + the resumeRun that
-    // follows it.
+    // published. A publish that races the block (e.g. from the HTTP trigger
+    // server while this step was executing) is handled by the same backstop
+    // the worker path uses: after writing the block, re-check for a matching
+    // event and wake in place if one already landed.
     if (isEventWaitSignal(e)) {
       await withTransaction(db, async (tx) => {
         const blocked = await registerStepEventWait(tx, {
@@ -293,6 +295,22 @@ async function runStep(
             type: 'step.waiting_for_event',
             data: { event: e.eventName, correlationKey: e.correlationKey ?? null, seq: e.seq },
           })
+          // Throw->block race backstop (same as worker.ts commitEventWait): an event
+          // published while this step was executing would have found the step still
+          // 'running' and woken nothing. After writing the block, check for a match
+          // at or after this attempt began and wake in place if one already landed.
+          const already = await findMatchingEventSince(tx, {
+            name: e.eventName,
+            correlationKey: e.correlationKey,
+            since: step.updated_at,
+          })
+          if (already) {
+            await wakeStepsWaitingForEvent(tx, {
+              name: already.name,
+              correlationKey: already.correlation_key ?? undefined,
+              payload: already.payload,
+            })
+          }
         }
       })
       return { runId: run.id, status: 'running' }

@@ -13,7 +13,7 @@
 
 import type { Db } from '../store/client.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
-import { claimUndispatchedEvents, startRunForWorkflowName, type EventRow } from '../store/repositories.ts'
+import { claimUndispatchedEvents, resetEventDispatch, startRunForWorkflowName, type EventRow } from '../store/repositories.ts'
 import type { WorkflowTrigger } from '../types.ts'
 
 type EventTrigger = Extract<WorkflowTrigger, { type: 'event' }>
@@ -69,6 +69,7 @@ export async function pollUndispatchedEvents(
   const result: PollEventsResult = { claimed: events.length, started: 0, errors: [] }
 
   for (const event of events) {
+    let eventFailed = false
     for (const workflow of workflows) {
       const matched = workflow.triggers.some((trigger) => matchesEventTrigger(trigger, event))
       if (!matched) continue
@@ -81,9 +82,14 @@ export async function pollUndispatchedEvents(
         })
         result.started++
       } catch (error) {
+        eventFailed = true
         result.errors.push({ event, workflowName: workflow.name, error })
       }
     }
+    // A claimed event whose routing partially failed must be retried, not lost:
+    // un-stamp its dispatch so the next tick re-claims it (idempotency keys stop
+    // already-started workflows from double-starting).
+    if (eventFailed) await resetEventDispatch(sql, event.id)
   }
 
   return result

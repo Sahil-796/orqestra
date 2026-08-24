@@ -44,10 +44,13 @@ function stringField(body: unknown, field: string): string | undefined {
  * The idempotency key is picked in priority order — an explicit
  * `Idempotency-Key` header wins (the same header the API-trigger route
  * honors), then a common provider convention (`X-Webhook-Id` /
- * `X-Delivery-Id`), then a body-level `id`/`eventId` field. Redelivery
- * without any of these is accepted but not deduplicated — the caller can't
- * promise exactly-once without SOME stable id to key on, and refusing the
- * whole delivery for that would be worse than an occasional duplicate wake.
+ * `X-Delivery-Id`), then an explicit body-level `idempotencyKey` field. Only
+ * an explicit delivery key is honored — a body-level `id`/`eventId` is
+ * commonly a resource identifier, so two distinct deliveries about the same
+ * resource would wrongly dedup. Redelivery without any explicit delivery key
+ * is accepted but not deduplicated — the caller can't promise exactly-once
+ * without SOME stable id to key on, and refusing the whole delivery for that
+ * would be worse than an occasional duplicate wake.
  */
 export function mapWebhookToEvent(input: WebhookRequestInput): MappedWebhookEvent {
   const routeName = input.routeName.trim()
@@ -65,9 +68,7 @@ export function mapWebhookToEvent(input: WebhookRequestInput): MappedWebhookEven
     header(input.headers, 'idempotency-key') ??
     header(input.headers, 'x-webhook-id') ??
     header(input.headers, 'x-delivery-id') ??
-    stringField(input.body, 'idempotencyKey') ??
-    stringField(input.body, 'id') ??
-    stringField(input.body, 'eventId')
+    stringField(input.body, 'idempotencyKey')
 
   return {
     name,
