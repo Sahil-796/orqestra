@@ -10,7 +10,7 @@
 // worker path gets aging without every caller threading the knobs through.
 
 import type { Db } from '../store/client.ts'
-import { loadConfig } from '../config.ts'
+import { loadConfig, type OrqConfig } from '../config.ts'
 import { claimNextStep, type StepRow } from '../store/repositories.ts'
 
 export interface ClaimOptions {
@@ -23,17 +23,23 @@ export interface ClaimOptions {
   priorityAgeMaxBoost?: number
 }
 
-// Loaded once at module init — the aging defaults are process-wide config, not
-// per-claim state, so re-reading env on every claim would be wasteful.
-const config = loadConfig()
+// Parsed once on first claim and cached — the aging defaults are process-wide
+// config, not per-claim state, so re-reading env on every claim would be
+// wasteful. Loaded lazily (not at module init) so merely importing this module
+// has no side effect and can't throw on bad env before a claim is ever made.
+let cachedConfig: OrqConfig | undefined
+function agingDefaults(): OrqConfig {
+  if (!cachedConfig) cachedConfig = loadConfig()
+  return cachedConfig
+}
 
 /**
  * Claim the next ready, due, unleased step for `workerId` and flip it to
  * `running` under a lease that expires in `leaseTtlMs`. Returns undefined
  * when there's nothing to claim right now (empty queue, everything ready
  * is still leased, everything ready isn't due yet, or every ready candidate
- * is blocked by a full concurrency key) — that's the normal "poll again
- * later" outcome, not an error.
+ * is blocked by a full concurrency key or an exhausted rate window) — that's
+ * the normal "poll again later" outcome, not an error.
  *
  * Candidates are ordered by *effective* priority (base priority plus an age
  * boost, #14) so long-waiting low-priority steps aren't starved by a flood of
@@ -49,7 +55,7 @@ export async function claimStep(db: Db, options: ClaimOptions): Promise<StepRow 
     workerId: options.workerId,
     leaseTtlMs: options.leaseTtlMs,
     namespace: options.namespace,
-    priorityAgeRatePerSec: options.priorityAgeRatePerSec ?? config.priorityAgeRatePerSec,
-    priorityAgeMaxBoost: options.priorityAgeMaxBoost ?? config.priorityAgeMaxBoost,
+    priorityAgeRatePerSec: options.priorityAgeRatePerSec ?? agingDefaults().priorityAgeRatePerSec,
+    priorityAgeMaxBoost: options.priorityAgeMaxBoost ?? agingDefaults().priorityAgeMaxBoost,
   })
 }

@@ -320,6 +320,10 @@ export async function resolveBlockedStepForChildRun(
     update step set
       status = 'ready',
       awaited_child_run_id = null,
+      -- Aging (#14) measures from run_after; a step becomes ready here after
+      -- waiting on a child, so start its age from now() rather than the stale
+      -- creation-time value.
+      run_after = now(),
       updated_at = now()
     where awaited_child_run_id = ${childRunId}
       and status = 'blocked'
@@ -519,6 +523,16 @@ export async function recordDependencySatisfied(
         ) then 'ready'
         else status
       end,
+      -- Priority aging (#14) ages from run_after, so reset it to now() at the
+      -- moment the step becomes ready — otherwise a deep-DAG step inherits its
+      -- creation-time run_after and lands with a large age (instant max boost)
+      -- despite having waited 0s in the ready queue.
+      run_after = case
+        when depends_on <@ (
+          select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+        ) then now()
+        else run_after
+      end,
       updated_at = now()
     where id = ${stepId} and status = 'pending'
     returning *
@@ -652,6 +666,14 @@ export async function claimNextStep(
             where rs.concurrency_key = s.concurrency_key and rs.status = 'running'
           ) < s.concurrency_limit
         )
+        and (
+          s.rate_key is null
+          or coalesce((
+            select count from rate_window
+            where rate_key = s.rate_key
+              and window_start = floor(extract(epoch from now()) * 1000 / s.rate_window_ms) * s.rate_window_ms
+          ), 0) < s.rate_limit
+        )
         ${namespaceFilter}
       order by
         (s.priority + least(
@@ -665,11 +687,25 @@ export async function claimNextStep(
     const candidate = candidates[0]
     if (!candidate) return undefined
 
-    // Keyed candidate: serialize per key and re-check the count under the
-    // advisory lock — this is the authoritative gate, the WHERE filter above is
-    // only a best-effort skip of full keys.
+    // Acquire the candidate's per-key advisory locks up front, in one global
+    // order (sorted by the key string). A step may carry BOTH a concurrency
+    // key and a rate key; taking them in a fixed order for every claim is what
+    // stops two claims whose concurrency/rate keys are crossed from deadlocking
+    // (each holding one and waiting on the other). Distinct keys only — an
+    // xact advisory lock is re-entrant, but deduping keeps it obvious. Held
+    // until commit; the concurrency recount and the rate consume below both run
+    // under whichever of these locks they need.
+    const lockKeys = [candidate.concurrency_key, candidate.rate_key].filter(
+      (k): k is string => k !== null
+    )
+    for (const key of [...new Set(lockKeys)].sort()) {
+      await tx`select pg_advisory_xact_lock(hashtext(${key}))`
+    }
+
+    // Keyed candidate: re-check the count under the advisory lock (already held
+    // above) — this is the authoritative gate, the WHERE filter above is only a
+    // best-effort skip of full keys.
     if (candidate.concurrency_key !== null) {
-      await tx`select pg_advisory_xact_lock(hashtext(${candidate.concurrency_key}))`
       const counts = await tx<{ running: string }[]>`
         select count(*)::text as running from step
         where concurrency_key = ${candidate.concurrency_key} and status = 'running'
@@ -679,12 +715,12 @@ export async function claimNextStep(
       if (running >= limit) return undefined
     }
 
-    // Keyed by a rate limit: serialize per key, then count-and-consume the
-    // current window's budget under the advisory lock. Runs AFTER the
-    // concurrency gate on purpose — the concurrency check has no side effect, so
-    // a step blocked by a full concurrency key must not have burned a rate token
-    // it never got to use. Consuming here is the authoritative "this start
-    // happened"; if the window is exhausted we defer instead of claiming.
+    // Keyed by a rate limit: count-and-consume the current window's budget under
+    // the advisory lock (already held above). Runs AFTER the concurrency gate on
+    // purpose — the concurrency check has no side effect, so a step blocked by a
+    // full concurrency key must not have burned a rate token it never got to
+    // use. Consuming here is the authoritative "this start happened"; if the
+    // window is exhausted we defer instead of claiming.
     if (
       candidate.rate_key !== null &&
       candidate.rate_limit !== null &&
@@ -693,7 +729,6 @@ export async function claimNextStep(
       const rateKey = candidate.rate_key
       const rateLimit = candidate.rate_limit
       const windowMs = candidate.rate_window_ms
-      await tx`select pg_advisory_xact_lock(hashtext(${rateKey}))`
       const consumed = await tx<{ count: number }[]>`
         insert into rate_window (rate_key, window_start, count)
         values (
@@ -1206,6 +1241,10 @@ export async function wakeStepsWaitingForEvent(
       waiting_event_correlation = null,
       event_seq = event_seq + 1,
       event_payloads = event_payloads || jsonb_build_array(${payloadJson}),
+      -- Aging (#14) measures from run_after; a step becomes ready here after
+      -- waiting for its event, so start its age from now() rather than the
+      -- stale creation-time value.
+      run_after = now(),
       updated_at = now()
     where status = 'blocked'
       and waiting_event_name = ${args.name}
