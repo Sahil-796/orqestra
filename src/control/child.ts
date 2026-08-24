@@ -133,40 +133,41 @@ export async function spawnChildRun(
   const namespace = options.namespace ?? (await getRun(db, parentCtx.runId))?.namespace
 
   const workflow = await childHandle.register(db)
-  const { run, created } = await createRun(db, {
-    workflowId: workflow.id,
-    namespace,
-    priority: options.priority,
-    input: options.input,
-    idempotencyKey,
-    parentRunId: parentCtx.runId,
-    // Undefined outside a worker (the context carries it only when
-    // worker.ts built it), which is exactly when there is no step row to
-    // point at anyway — the column stays null, as it did before.
-    parentStepId: getContextStepId(parentCtx),
-  })
 
-  if (!created) return { runId: run.id, created: false }
+  return withTransaction(db, async (tx) => {
+    const { run, created } = await createRun(tx, {
+      workflowId: workflow.id,
+      namespace,
+      priority: options.priority,
+      input: options.input,
+      idempotencyKey,
+      parentRunId: parentCtx.runId,
+      // Undefined outside a worker (the context carries it only when
+      // worker.ts built it), which is exactly when there is no step row to
+      // point at anyway — the column stays null, as it did before.
+      parentStepId: getContextStepId(parentCtx),
+    })
 
-  const steps: NewStep[] = childHandle.definition.steps.map((step) => ({
-    name: step.name,
-    dependsOn: step.dependsOn,
-    maxAttempts: step.maxAttempts,
-    timeoutMs: step.timeoutMs,
-    priority: step.priority,
-    status: step.dependsOn.length === 0 ? 'ready' : 'pending',
-  }))
+    if (!created) return { runId: run.id, created: false }
 
-  await withTransaction(db, async (tx) => {
+    const steps: NewStep[] = childHandle.definition.steps.map((step) => ({
+      name: step.name,
+      dependsOn: step.dependsOn,
+      maxAttempts: step.maxAttempts,
+      timeoutMs: step.timeoutMs,
+      priority: step.priority,
+      status: step.dependsOn.length === 0 ? 'ready' : 'pending',
+    }))
+
     await insertSteps(tx, run.id, steps)
     await insertHistory(tx, {
       runId: run.id,
       type: 'run.created',
       data: { input: options.input, parentRunId: parentCtx.runId },
     })
-  })
 
-  return { runId: run.id, created: true }
+    return { runId: run.id, created: true }
+  })
 }
 
 /**
@@ -189,7 +190,7 @@ export async function getChildOutcome(db: Db, childRunId: string): Promise<Child
   // first one's `error` — the same `SerializedError` worker.ts's own
   // commitOutcome/commitCancellation persist onto the step row.
   const steps = await getStepsByRun(db, childRunId)
-  const failedStep = steps.find((s) => s.status === 'failed' || s.status === 'cancelled')
+  const failedStep = steps.find((s) => s.status === 'failed') ?? steps.find((s) => s.status === 'cancelled')
   const error = failedStep?.error as SerializedError | undefined
   return classifyChildRun(run.status, undefined, error)
 }

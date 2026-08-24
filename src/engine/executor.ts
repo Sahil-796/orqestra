@@ -172,6 +172,16 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
     }
 
     for (const step of readySteps) {
+      // Phase 4 #17: cascade-skip — a step whose every dependency resolved by
+      // being skipped (none completed) has no real input, so skip it rather
+      // than run dead code, matching the worker path's cascadeIfAllDepsSkipped.
+      if (step.depends_on.length > 0) {
+        const deps = steps.filter((s) => step.depends_on.includes(s.name))
+        if (deps.length > 0 && !deps.some((d) => d.status === 'completed')) {
+          await skipStep(db, step.id, `all dependencies skipped: ${deps.map((d) => d.name).join(', ')}`)
+          continue
+        }
+      }
       const result = await runStep(db, handle, run, step)
       if (result) return result // fail-fast: first failure stops the run
     }
