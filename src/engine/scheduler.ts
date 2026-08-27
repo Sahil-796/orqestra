@@ -11,12 +11,24 @@ export interface StepLike {
   depends_on: string[]
 }
 
-/** A step's dependencies are satisfied once every named dep has completed. */
+// Phase 4 (#17 conditional branching): a `skipped` dependency counts as
+// resolved for readiness purposes exactly like a `completed` one — the
+// engine layer's policy call (see engine/dag.ts's module doc for the full
+// reasoning), applied here too so the whole-run rescan and the narrow
+// per-row primitive (repositories.ts's `recordDependencySatisfied`) agree.
+// Without this, an untaken conditional branch would permanently strand any
+// downstream fan-in join that names it in `dependsOn` — that's exactly the
+// deadlock #17 must not cause.
+function isResolved(status: string): boolean {
+  return status === 'completed' || status === 'skipped'
+}
+
+/** A step's dependencies are satisfied once every named dep has resolved (completed or skipped). */
 export function dependenciesSatisfied<T extends StepLike>(
   step: T,
   all: readonly StepLike[]
 ): boolean {
-  return step.depends_on.every((depName) => all.find((s) => s.name === depName)?.status === 'completed')
+  return step.depends_on.every((depName) => isResolved(all.find((s) => s.name === depName)?.status ?? ''))
 }
 
 /** Every `pending` step whose deps are all `completed` right now. */
@@ -28,8 +40,13 @@ export function newlyReadySteps<T extends StepLike>(all: readonly T[]): T[] {
 // replaces in executor.ts — a workflow with zero steps shouldn't occur in
 // practice (defineWorkflow always registers at least one), so this isn't
 // specially guarded against.
+//
+// Phase 4: `skipped` is as terminal-and-fine as `completed` here too — a run
+// whose every step either ran or was the untaken half of a conditional
+// branch is done, not stuck waiting for something that was never going to
+// run.
 export function isRunComplete(all: readonly StepLike[]): boolean {
-  return all.every((step) => step.status === 'completed')
+  return all.every((step) => step.status === 'completed' || step.status === 'skipped')
 }
 
 // Blocked = stuck for good, not just "not done yet": nothing is currently

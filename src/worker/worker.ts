@@ -20,6 +20,13 @@
 //                   one that closes out its own step, cooperatively.
 // None of them weaken Phase 2's fencing: each is a fenced write in its own
 // transaction, and a worker that lost its lease writes nothing at all.
+//
+// Phase 4 adds a fourth (#20, child workflows): a step that awaits a child
+// run suspends into `blocked` (commitChildBlock, the sibling of commitSleep)
+// and is woken by the child's terminal transition rather than by a clock.
+// The wake side lives in every path here that drives a run terminal — see
+// wakeParentAwaiting's call sites in commitOutcome/commitCancellation and in
+// engine/dag.ts's maybeFinalizeRun.
 
 import { hostname } from 'node:os'
 import { loadConfig } from '../config.ts'
@@ -27,14 +34,16 @@ import type { Db } from '../store/client.ts'
 import { withTransaction } from '../store/client.ts'
 import { claimStep } from '../queue/claim.ts'
 import { heartbeatLease, releaseLease, reclaimExpiredLeases } from '../queue/lease.ts'
-import { advanceRun } from '../engine/executor.ts'
+import { advanceDag, sweepBlockedChildAwaits, wakeParentAwaiting } from '../engine/dag.ts'
 import {
+  blockStepOnChildRun,
   cancelPendingSteps,
   cancelRunningStep,
   clearSleepMarker,
   completeStep,
   failStep,
   finalizeCancelledRun,
+  findMatchingEventSince,
   getRun,
   getWorkflowById,
   isCancellationRequested,
@@ -42,17 +51,21 @@ import {
   lockStepIfOwner,
   markRunStarted,
   markStepReady,
+  registerStepEventWait,
   retryStep,
   insertHistory,
   sleepStep,
   updateRunStatus,
+  wakeStepsWaitingForEvent,
   type RunRow,
   type StepRow,
 } from '../store/repositories.ts'
 import { serializeError } from '../types.ts'
-import { createWorkflowContext } from '../define/context.ts'
+import { createWorkflowContext, getSkipRequests, type WorkflowContext } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { DEFAULT_RETRY_POLICY, nextRunAfter, shouldRetry, type RetryPolicy } from '../engine/retry.ts'
+import { isChildBlockSignal, isTerminalRunStatus, type ChildBlockSignal } from '../engine/child.ts'
+import { isEventWaitSignal, type EventWaitSignal } from '../engine/event.ts'
 import { isSleepSignal, type SleepSignal } from '../engine/sleep.ts'
 import { isStepTimeoutError, withTimeout } from '../engine/timeout.ts'
 import { createLogger, type Logger } from '../observability/logger.ts'
@@ -114,7 +127,10 @@ interface ResolvedRun {
 }
 
 type StepOutcome =
-  | { kind: 'success'; value: unknown }
+  // `skipNames` (Phase 4 #17): sibling step names this step's function
+  // handed to `ctx.skip(...)` before returning — the untaken branch,
+  // applied atomically alongside this step's own completion.
+  | { kind: 'success'; value: unknown; skipNames: readonly string[] }
   // `timedOut` only changes the history label — a timeout is an ordinary
   // failure as far as the retry/backoff decision is concerned (Phase 3 #10).
   | { kind: 'failure'; error: unknown; forcePermanent?: boolean; timedOut?: boolean }
@@ -125,8 +141,16 @@ type StepOutcome =
 // `sleep` (the step asked to be suspended) and `cancelled` (the run was
 // cancelled underneath it).
 type Attempt =
-  | { kind: 'success'; value: unknown }
+  | { kind: 'success'; value: unknown; skipNames: readonly string[] }
   | { kind: 'sleep'; signal: SleepSignal }
+  // Phase 4 #20: the step is awaiting a child run that hasn't finished. Like
+  // `sleep` this is a suspension, not a failure — the difference is what
+  // wakes it (the child's terminal transition, not a clock).
+  | { kind: 'child-block'; signal: ChildBlockSignal }
+  // Phase 5 #18: the step is waiting for a published event. Same family as
+  // `sleep`/`child-block` — a suspension, not a failure; woken by a matching
+  // publishEvent rather than a clock or a child's terminal transition.
+  | { kind: 'event-wait'; signal: EventWaitSignal; since: Date }
   | { kind: 'cancelled' }
   | { kind: 'timeout'; error: unknown }
   | { kind: 'failure'; error: unknown }
@@ -210,7 +234,25 @@ export function createWorker(options: WorkerOptions): Worker {
           data: { result: outcome.value },
         })
         await releaseLease(tx, step.id)
-        await advanceRun(tx, run.id)
+
+        // Phase 4: fan-out/fan-in/dependency release (#15/#16/#19) via the
+        // narrow per-row primitive, plus any conditional-branch skips this
+        // step declared via ctx.skip() (#17) — see engine/dag.ts's module
+        // doc for why this replaces the old advanceRun(tx, run.id) rescan
+        // call here specifically (not in executor.ts's inline path, which
+        // keeps using advanceRun).
+        const { skippedSteps } = await advanceDag(tx, run.id, {
+          completedName: step.name,
+          skipNames: outcome.skipNames,
+        })
+        for (const skipped of skippedSteps) {
+          await insertHistory(tx, {
+            runId: run.id,
+            stepId: skipped.id,
+            type: 'step.skipped',
+            data: { reason: skipped.skip_reason },
+          })
+        }
         return
       }
 
@@ -251,6 +293,14 @@ export function createWorker(options: WorkerOptions): Worker {
       await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
       await cancelPendingSteps(tx, run.id)
       await insertHistory(tx, { runId: run.id, type: 'run.failed', data: { reason: 'step.failed', stepId: step.id } })
+      // Phase 4 #20: this run may be someone's child, and a `failed` child
+      // has to release its awaiting parent step exactly as a completed one
+      // does — the parent then replays, reads the failure via
+      // getChildOutcome, and applies its own propagation policy. Inside
+      // this transaction on purpose (see dag.ts's wakeParentAwaiting).
+      // Note cancelPendingSteps above cannot do this job: it only touches
+      // `pending`/`ready`, and the awaiting step is in a different run.
+      await wakeParentAwaiting(tx, run.id)
     })
   }
 
@@ -291,6 +341,177 @@ export function createWorker(options: WorkerOptions): Worker {
       })
       // No releaseLease: sleepStep already cleared lease_owner/expires_at as
       // part of handing the row back to the queue.
+    })
+  }
+
+  // Child block (#20). The sibling of commitSleep: same fencing, same
+  // "hand the worker back" shape, different wake condition — a sleeping step
+  // is `ready` with a future `run_after` and wakes on a clock, a blocked step
+  // is `blocked` with `awaited_child_run_id` set and wakes only when the
+  // child run it names reaches a terminal status. Neither is claimable in the
+  // meantime, and neither is visible to the lease reaper (findExpiredLeases
+  // only scans `running`), so nothing resurrects a blocked step as if its
+  // worker had crashed.
+  //
+  // ## The lock order here is load-bearing
+  //
+  // The CHILD run row is locked FIRST — before this step's own fence, before
+  // the parent run. That is what makes the block and the wake mutually
+  // exclusive: every finalizer calls `wakeParentAwaiting` while holding (or
+  // just after releasing) that same child-run row lock, so the two orderings
+  // are the only two possible outcomes, and both are correct:
+  //
+  //   * block first  — the finalizer waits for this transaction, then sees a
+  //                    `blocked` step and flips it back to `ready`.
+  //   * finalize first — `lockRun` below waits for it and then reads the
+  //                    now-terminal status, so this transaction blocks the
+  //                    step and immediately un-blocks it in place, leaving it
+  //                    `ready` for the next claim.
+  //
+  // Locking the child before the parent step (and the parent step before the
+  // parent run, matching commitOutcome's existing step -> run order) also
+  // means no transaction ever holds one of these rows while waiting on the
+  // other in the opposite direction — i.e. no deadlock cycle.
+  async function commitChildBlock(step: StepRow, run: RunRow, signal: ChildBlockSignal): Promise<void> {
+    await withTransaction(db, async (tx) => {
+      const child = await lockRun(tx, signal.childRunId)
+      if (!child) {
+        // The child run row is gone — nothing to wait for and nothing that
+        // could ever wake us. Leave the step `running` and let the lease
+        // expire into the reclaim sweep, which replays it; getChildOutcome
+        // then throws and the step fails honestly instead of blocking on a
+        // ghost.
+        log.error('step blocked on a child run that does not exist — refusing to block', {
+          stepId: step.id,
+          runId: run.id,
+          childRunId: signal.childRunId,
+        })
+        return
+      }
+
+      const owned = await lockStepIfOwner(tx, step.id, workerId)
+      if (!owned) {
+        log.warn('lease fencing failed at child-block time — not blocking, another worker owns this step now', {
+          stepId: step.id,
+          runId: run.id,
+        })
+        return
+      }
+      await lockRun(tx, run.id)
+
+      // Re-asserts the same fence in its own WHERE clause (status running +
+      // lease_owner), exactly like sleepStep: a missing row means "write
+      // nothing".
+      const blocked = await blockStepOnChildRun(tx, {
+        stepId: step.id,
+        workerId,
+        childRunId: signal.childRunId,
+      })
+      if (!blocked) return
+
+      await insertHistory(tx, {
+        runId: run.id,
+        stepId: step.id,
+        type: 'step.blocked',
+        data: { childRunId: signal.childRunId },
+      })
+
+      if (isTerminalRunStatus(child.status)) {
+        // The child finished in the window between the step reading its
+        // outcome and this commit. Resolve the block we just wrote rather
+        // than leaving a step waiting on an event that already happened.
+        const woken = await wakeParentAwaiting(tx, signal.childRunId)
+        if (woken) {
+          log.info('child was already terminal at block time — step is ready again immediately', {
+            stepId: step.id,
+            runId: run.id,
+            childRunId: signal.childRunId,
+          })
+        }
+      }
+      // No releaseLease: blockStepOnChildRun already cleared
+      // lease_owner/lease_expires_at as part of parking the row.
+    })
+  }
+
+  // Event wait (#18). The sibling of commitSleep/commitChildBlock: same
+  // fencing, same "hand the worker back" shape. A waiting step is `blocked`
+  // with `waiting_event_name` set and wakes only when a matching
+  // `publishEvent` arrives — never a clock, never the reclaim sweep
+  // (findExpiredLeases only scans `running`).
+  //
+  // ## Closing the throw->block race
+  //
+  // `publishEvent` wakes only steps that are already `blocked`. An event
+  // published in the window between the step throwing its signal and this
+  // commit writing the `blocked` row would be missed by that live wake — the
+  // step is still `running`. So after writing the block, this checks the
+  // events log for a match that landed at or after this attempt began
+  // (`signal.since` = the step's claim time, a DB timestamp — no clock skew)
+  // and wakes itself in place if so.
+  //
+  // That backstop and `publishEvent`'s live wake are mutually exclusive per
+  // event, which is what keeps the wake exactly-once. `registerStepEventWait`
+  // holds this step's row lock from its write through this transaction's
+  // commit, and `publishEvent`'s wake needs that same row lock, so the two
+  // serialize: either the publish committed first (its event is visible to
+  // the backstop, which wakes; its own wake found the step not yet blocked
+  // and did nothing), or it runs after this commit (it wakes the now-blocked
+  // step; the backstop, having seen no committed event, did nothing).
+  async function commitEventWait(step: StepRow, run: RunRow, signal: EventWaitSignal, since: Date): Promise<void> {
+    await withTransaction(db, async (tx) => {
+      const owned = await lockStepIfOwner(tx, step.id, workerId)
+      if (!owned) {
+        log.warn('lease fencing failed at event-wait time — not blocking, another worker owns this step now', {
+          stepId: step.id,
+          runId: run.id,
+        })
+        return
+      }
+      await lockRun(tx, run.id)
+
+      const blocked = await registerStepEventWait(tx, {
+        stepId: step.id,
+        workerId,
+        eventName: signal.eventName,
+        correlationKey: signal.correlationKey,
+      })
+      if (!blocked) return
+
+      await insertHistory(tx, {
+        runId: run.id,
+        stepId: step.id,
+        type: 'step.waiting_for_event',
+        data: { event: signal.eventName, correlationKey: signal.correlationKey ?? null, seq: signal.seq },
+      })
+
+      const already = await findMatchingEventSince(tx, {
+        name: signal.eventName,
+        correlationKey: signal.correlationKey,
+        since,
+      })
+      if (already) {
+        const woken = await wakeStepsWaitingForEvent(tx, {
+          name: already.name,
+          correlationKey: already.correlation_key ?? undefined,
+          payload: already.payload,
+        })
+        if (woken.length > 0) {
+          await insertHistory(tx, {
+            runId: run.id,
+            stepId: step.id,
+            type: 'step.event_delivered',
+            data: { event: already.name, eventId: already.id, raced: true },
+          })
+          log.info('event had already been published at block time — step is ready again immediately', {
+            stepId: step.id,
+            runId: run.id,
+            event: signal.eventName,
+          })
+        }
+      }
+      // No releaseLease: registerStepEventWait already cleared the lease as
+      // part of parking the row.
     })
   }
 
@@ -336,6 +557,14 @@ export function createWorker(options: WorkerOptions): Worker {
     // so there is nothing left in flight for this run from this worker.
     const { run: finalized, cancelledSteps } = await finalizeCancelledRun(db, run.id)
     if (finalized) {
+      // #20: a cancelled run is terminal, so anything blocked on it as a
+      // child wakes here. Strictly after finalizeCancelledRun's transaction
+      // committed — which is exactly the ordering wakeParentAwaiting
+      // requires, since a concurrent commitChildBlock could only have gone
+      // either wholly before that transaction (its `blocked` write is
+      // visible to us now) or wholly after it (it reads `cancelled` and
+      // un-blocks itself).
+      await wakeParentAwaiting(db, run.id)
       await insertHistory(db, {
         runId: run.id,
         type: 'run.cancelled',
@@ -474,6 +703,10 @@ export function createWorker(options: WorkerOptions): Worker {
     // in memory; nothing is written until the commit* call below, so a lease
     // that moved on can still discard all of it.
     let attempt: Attempt
+    // Hoisted so it survives past `withTimeout`'s callback — success needs
+    // to read `ctx.skip()` requests (feature #17) back out via
+    // `getSkipRequests` after `fn` has returned, not just its return value.
+    let ctx: WorkflowContext | undefined
     try {
       // Run the user function OUTSIDE any transaction — it may be slow or
       // call out to the world. Only the outcome's persistence is atomic.
@@ -486,19 +719,28 @@ export function createWorker(options: WorkerOptions): Worker {
       // across a worker restart), and the context resolves the first
       // `sleep_seq` sleep() calls immediately instead of suspending again.
       const value = await withTimeout(
-        (signal) =>
-          fn(
-            createWorkflowContext({
-              runId: run.id,
-              input: run.input,
-              sleepSeq: step.sleep_seq,
-              signal,
-            })
-          ),
+        (signal) => {
+          ctx = createWorkflowContext({
+            runId: run.id,
+            input: run.input,
+            sleepSeq: step.sleep_seq,
+            // #18: how many event-waits this step has already served, and the
+            // payloads they were woken with — so a replayed step returns from
+            // an already-satisfied waitForEvent instead of re-suspending.
+            eventSeq: step.event_seq,
+            eventPayloads: step.event_payloads,
+            signal,
+            // #20: lets a spawned child record `run.parent_step_id`. The
+            // block itself needs nothing from the context — this closure
+            // already owns `step.id`/`workerId`.
+            stepId: step.id,
+          })
+          return fn(ctx)
+        },
         step.timeout_ms,
         cancelController.signal
       )
-      attempt = { kind: 'success', value }
+      attempt = { kind: 'success', value, skipNames: ctx ? getSkipRequests(ctx) : [] }
     } catch (e) {
       // Order matters. A SleepSignal is control flow, not a failure, and must
       // survive the timeout race untouched — withTimeout only ever *adds* a
@@ -508,6 +750,20 @@ export function createWorker(options: WorkerOptions): Worker {
         // ...unless the run is already cancelled, in which case suspending it
         // for 24h just to cancel it on wake is silly. Cancel it now.
         attempt = cancelObserved ? { kind: 'cancelled' } : { kind: 'sleep', signal: e }
+      } else if (isChildBlockSignal(e)) {
+        // Same shape as the sleep case, same reasoning: a child block is
+        // control flow that survives the timeout race untouched — but if the
+        // run is already cancelled, parking the step on a child nobody will
+        // wait for is pointless, so cancel it now.
+        attempt = cancelObserved ? { kind: 'cancelled' } : { kind: 'child-block', signal: e }
+      } else if (isEventWaitSignal(e)) {
+        // #18: same family as sleep/child-block. `since` is the step's claim
+        // time (step.updated_at, frozen in the row we claimed) — the lower
+        // bound for the throw->block race backstop in commitEventWait. If the
+        // run is already cancelled, don't park it waiting for an event.
+        attempt = cancelObserved
+          ? { kind: 'cancelled' }
+          : { kind: 'event-wait', signal: e, since: step.updated_at }
       } else if (cancelObserved) {
         // Cancellation outranks the timeout label deliberately: once we abort
         // the signal, a cooperative step throws (an AbortError, or its own
@@ -532,10 +788,20 @@ export function createWorker(options: WorkerOptions): Worker {
 
     switch (attempt.kind) {
       case 'success':
-        await commitOutcome(step, run, { kind: 'success', value: attempt.value })
+        await commitOutcome(step, run, {
+          kind: 'success',
+          value: attempt.value,
+          skipNames: attempt.skipNames,
+        })
         return
       case 'sleep':
         await commitSleep(step, run, attempt.signal)
+        return
+      case 'child-block':
+        await commitChildBlock(step, run, attempt.signal)
+        return
+      case 'event-wait':
+        await commitEventWait(step, run, attempt.signal, attempt.since)
         return
       case 'cancelled':
         await commitCancellation(step, run, 'in-flight')
@@ -566,6 +832,23 @@ export function createWorker(options: WorkerOptions): Worker {
           }
         } catch (e) {
           log.error('reclaim sweep failed', { error: serializeError(e) })
+        }
+
+        // #20's reconciliation net, on the same tick because it has the same
+        // character as the reclaim sweep: a cheap periodic check that only
+        // ever does something when an inline path failed to. See
+        // sweepBlockedChildAwaits — it cannot wake a step whose child is
+        // still in flight, so this is not polling, and a non-empty result is
+        // a signal that some finalization path is missing its inline wake.
+        try {
+          const woken = await sweepBlockedChildAwaits(db)
+          if (woken.length > 0) {
+            log.warn('blocked-step sweep woke steps an inline finalization path should have woken', {
+              steps: woken.length,
+            })
+          }
+        } catch (e) {
+          log.error('blocked-step sweep failed', { error: serializeError(e) })
         }
       }
 

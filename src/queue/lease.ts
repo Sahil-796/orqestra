@@ -15,6 +15,7 @@ import {
   poisonStep,
   reclaimStep,
   releaseStep,
+  resolveBlockedStepForChildRun,
   updateRunStatus,
 } from '../store/repositories.ts'
 import { serializeError } from '../types.ts'
@@ -100,6 +101,10 @@ export async function reclaimExpiredLeases(
         })
         // Stop other workers from picking up the rest of this now-dead run.
         await cancelPendingSteps(tx, poisoned.run_id)
+        // This run just went terminal, so if it was somebody's child, the
+        // parent step blocked on it has to be woken — otherwise the parent
+        // waits for the sweep to notice a child that will never finish.
+        await resolveBlockedStepForChildRun(tx, poisoned.run_id)
       })
       deadLettered.push(step.id)
       continue

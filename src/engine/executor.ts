@@ -11,6 +11,7 @@ import {
   completeStep,
   createRun,
   failStep,
+  findMatchingEventSince,
   getIncompleteRuns,
   getRun,
   getStepsByRun,
@@ -20,16 +21,21 @@ import {
   lockRun,
   markStepReady,
   markStepRunning,
+  registerStepEventWait,
   resetRunningSteps,
+  skipStep,
   updateRunStatus,
+  wakeStepsWaitingForEvent,
   type NewStep,
   type RunRow,
   type StepRow,
 } from '../store/repositories.ts'
 import { decodeResult, serializeError, type RunStatus } from '../types.ts'
-import { createWorkflowContext } from '../define/context.ts'
+import { createWorkflowContext, getSkipRequests } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { createLogger } from '../observability/logger.ts'
+import { isEventWaitSignal } from './event.ts'
+import { wakeParentAwaiting } from './dag.ts'
 import { isRunComplete, newlyReadySteps } from './scheduler.ts'
 
 const logger = createLogger()
@@ -85,6 +91,11 @@ async function registerAndCreateRun(
     maxAttempts: step.maxAttempts,
     timeoutMs: step.timeoutMs,
     priority: step.priority,
+    concurrencyKey: step.concurrency?.key,
+    concurrencyLimit: step.concurrency?.limit,
+    rateKey: step.rateLimit?.key,
+    rateLimit: step.rateLimit?.limit,
+    rateWindowMs: step.rateLimit?.windowMs,
     status: step.dependsOn.length === 0 ? 'ready' : 'pending',
   }))
 
@@ -162,6 +173,17 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
 
     const readySteps = steps.filter((s) => s.status === 'ready')
     if (readySteps.length === 0) {
+      // #18: a step suspended on `ctx.waitForEvent` sits in `blocked` with no
+      // ready siblings — the run is not stuck, it is parked until a matching
+      // event is published. Return without finalizing; a later resumeRun
+      // (after the event lands and the step is back to `ready`) continues it.
+      // This is the inline-driver analogue of the worker parking the step and
+      // giving its slot back. (The inline driver still cannot itself PUBLISH
+      // the event mid-loop — it is single-process and sequential — so the
+      // publish must come from outside, then resumeRun.)
+      if (steps.some((s) => s.status === 'blocked')) {
+        return { runId, status: 'running' }
+      }
       // A well-formed DAG always has something ready or completed; getting
       // here means every remaining step is blocked on a dep that will
       // never complete (e.g. a cycle, or a dep name typo) — surface it
@@ -170,6 +192,16 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
     }
 
     for (const step of readySteps) {
+      // Phase 4 #17: cascade-skip — a step whose every dependency resolved by
+      // being skipped (none completed) has no real input, so skip it rather
+      // than run dead code, matching the worker path's cascadeIfAllDepsSkipped.
+      if (step.depends_on.length > 0) {
+        const deps = steps.filter((s) => step.depends_on.includes(s.name))
+        if (deps.length > 0 && !deps.some((d) => d.status === 'completed')) {
+          await skipStep(db, step.id, `all dependencies skipped: ${deps.map((d) => d.name).join(', ')}`)
+          continue
+        }
+      }
       const result = await runStep(db, handle, run, step)
       if (result) return result // fail-fast: first failure stops the run
     }
@@ -194,11 +226,24 @@ async function runStep(
       await failStep(tx, step.id, error)
       await insertHistory(tx, { runId: run.id, stepId: step.id, type: 'step.failed', data: { error } })
       await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
+      // This run may itself be some other run's child (#20) — a run that
+      // ends `failed` must wake whoever is blocked on it just as surely as
+      // one that completes. Same transaction as the status write; see
+      // dag.ts's wakeParentAwaiting for why that ordering is required.
+      await wakeParentAwaiting(tx, run.id)
     })
     return { runId: run.id, status: 'failed' }
   }
 
-  const ctx = createWorkflowContext({ runId: run.id, input: run.input })
+  const ctx = createWorkflowContext({
+    runId: run.id,
+    input: run.input,
+    stepId: step.id,
+    // #18: replay an already-satisfied waitForEvent from its delivered
+    // payload rather than re-suspending. Set once a prior wait was woken.
+    eventSeq: step.event_seq,
+    eventPayloads: step.event_payloads,
+  })
 
   // Run the user function OUTSIDE a transaction (it may be slow / call out
   // to the world); only the persistence of its outcome is atomic.
@@ -212,14 +257,76 @@ async function runStep(
         type: 'step.completed',
         data: { result: value },
       })
+
+      // Feature #17, inline-driver half: apply any `ctx.skip(...)` requests
+      // made by this step. Deliberately simpler than worker.ts's
+      // advanceDag — no cascade-skip through a chain of branch-only steps,
+      // just the direct names this step named — because the next loop
+      // iteration's `advanceRun` rescan (scheduler.ts's
+      // `dependenciesSatisfied`, which now treats `skipped` as satisfied
+      // exactly like `completed`) picks up everything downstream from
+      // there. The inline path is single-process/sequential; the worker
+      // path (this phase's shipping bar) is where the full cascade policy
+      // lives.
+      const skipNames = getSkipRequests(ctx)
+      if (skipNames.length > 0) {
+        const siblings = await getStepsByRun(tx, run.id)
+        for (const name of skipNames) {
+          const target = siblings.find((s) => s.name === name)
+          if (target) await skipStep(tx, target.id, 'branch not taken')
+        }
+      }
     })
     return undefined
   } catch (e) {
+    // #18: an event-wait is control flow, not a failure. Park the step in
+    // `blocked` (no lease to fence in this single-process path) and stop
+    // driving the run — executeRun's caller resumes it after the event is
+    // published. A publish that races the block (e.g. from the HTTP trigger
+    // server while this step was executing) is handled by the same backstop
+    // the worker path uses: after writing the block, re-check for a matching
+    // event and wake in place if one already landed.
+    if (isEventWaitSignal(e)) {
+      await withTransaction(db, async (tx) => {
+        const blocked = await registerStepEventWait(tx, {
+          stepId: step.id,
+          eventName: e.eventName,
+          correlationKey: e.correlationKey,
+        })
+        if (blocked) {
+          await insertHistory(tx, {
+            runId: run.id,
+            stepId: step.id,
+            type: 'step.waiting_for_event',
+            data: { event: e.eventName, correlationKey: e.correlationKey ?? null, seq: e.seq },
+          })
+          // Throw->block race backstop (same as worker.ts commitEventWait): an event
+          // published while this step was executing would have found the step still
+          // 'running' and woken nothing. After writing the block, check for a match
+          // at or after this attempt began and wake in place if one already landed.
+          const already = await findMatchingEventSince(tx, {
+            name: e.eventName,
+            correlationKey: e.correlationKey,
+            since: step.updated_at,
+          })
+          if (already) {
+            await wakeStepsWaitingForEvent(tx, {
+              name: already.name,
+              correlationKey: already.correlation_key ?? undefined,
+              payload: already.payload,
+            })
+          }
+        }
+      })
+      return { runId: run.id, status: 'running' }
+    }
+
     const error = serializeError(e)
     await withTransaction(db, async (tx) => {
       await failStep(tx, step.id, error)
       await insertHistory(tx, { runId: run.id, stepId: step.id, type: 'step.failed', data: { error } })
       await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
+      await wakeParentAwaiting(tx, run.id)
     })
     return { runId: run.id, status: 'failed' }
   }
@@ -275,12 +382,25 @@ export async function advanceRun(sql: Db, runId: string): Promise<AdvanceResult>
 
   const output: Record<string, unknown> = {}
   for (const step of steps) {
+    // Phase 4: a `skipped` step (#17's untaken branch) never ran and has no
+    // `result` to decode — `decodeResult` would throw on its null column.
+    // Its contribution to `output` is simply absent-of-a-value, same as
+    // what a completed-but-void step would produce.
+    if (step.status === 'skipped') {
+      output[step.name] = undefined
+      continue
+    }
     const decoded = decodeResult<unknown>(step.result)
     output[step.name] = decoded.ok ? decoded.value : undefined
   }
 
   await updateRunStatus(sql, runId, 'completed', { output, finishedAt: new Date() })
   await insertHistory(sql, { runId, type: 'run.completed', data: { output } })
+  // #20: wake any step blocked on this run as a child. The worker path's
+  // equivalent lives in dag.ts's maybeFinalizeRun; this is the inline
+  // driver's copy, so a child run driven by executeRun still releases a
+  // parent that a worker pool is holding blocked.
+  await wakeParentAwaiting(sql, runId)
 
   return { steps, result: { runId, status: 'completed', output } }
 }

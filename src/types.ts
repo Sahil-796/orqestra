@@ -2,7 +2,19 @@
 
 export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 
-export type StepStatus = 'pending' | 'ready' | 'running' | 'completed' | 'failed' | 'cancelled'
+// Phase 4 adds two values (0004_orchestration.sql):
+//   'skipped' — an untaken conditional branch (#17); terminal, not an error.
+//   'blocked' — a step durably awaiting a child run's outcome (#20); like a
+//   sleeping step, it holds no lease while in this state.
+export type StepStatus =
+  | 'pending'
+  | 'ready'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'skipped'
+  | 'blocked'
 
 export const RUN_STATUSES: readonly RunStatus[] = [
   'queued',
@@ -19,7 +31,43 @@ export const STEP_STATUSES: readonly StepStatus[] = [
   'completed',
   'failed',
   'cancelled',
+  'skipped',
+  'blocked',
 ]
+
+// ---- signals & triggers (Phase 5) -----------------------------------------
+//
+// `ScheduleKind` mirrors the `schedules.kind` CHECK constraint
+// (0005_signals_triggers.sql) the same way `RunStatus`/`StepStatus` mirror
+// theirs — add a value in both places or the DB and the types drift.
+
+export type ScheduleKind = 'cron' | 'once'
+
+export const SCHEDULE_KINDS: readonly ScheduleKind[] = ['cron', 'once']
+
+/**
+ * A declarative trigger a workflow carries in its definition so the trigger
+ * daemon (Agent 3) can start runs of it without the workflow being invoked
+ * by hand. This is data only — declaring a trigger implements nothing; the
+ * daemon reads these and acts on them. A workflow may carry several.
+ *
+ *   - `event`: start a run whenever a matching event is published. An
+ *     optional `correlationKey` narrows which events count (same matching
+ *     rule as `waitForEvent`).
+ *   - `cron`: start a run on a cron schedule.
+ */
+export type WorkflowTrigger =
+  | { type: 'event'; event: string; correlationKey?: string }
+  | { type: 'cron'; cron: string }
+
+/** Options accepted by `ctx.waitForEvent(name, opts?)`. */
+export interface WaitForEventOptions {
+  /**
+   * Narrow the wait to events carrying this correlation value. Omit to be
+   * woken by any event of the given name.
+   */
+  correlationKey?: string
+}
 
 // ---- workflow / step definitions -----------------------------------------
 //
@@ -28,12 +76,46 @@ export const STEP_STATUSES: readonly StepStatus[] = [
 // in-process (registered via defineWorkflow), keyed by step name, so the
 // engine can look them up when it replays a run.
 
+// ---- flow control at scale (Phase 6) --------------------------------------
+//
+// A step may declare a concurrency *key* and a *limit* (#12): at claim time it
+// is only claimable if fewer than `limit` steps sharing that key are currently
+// `running`. This is data on the step definition — the enforcement lives in the
+// claim query (repositories.ts `claimNextStep`) and its policy helpers in
+// control/concurrency.ts. A step with no `concurrency` is unlimited (the common
+// case), and the un-keyed claim path is unaffected.
+export interface ConcurrencyLimit {
+  /** Steps sharing this key contend for the same limit, across all runs. */
+  key: string
+  /** Max steps with this key allowed `running` at once. Must be >= 1. */
+  limit: number
+}
+
+// Rate limiting (#13): at most `limit` steps sharing `key` may *start* within
+// any one fixed `windowMs` window, across all runs. Distinct from concurrency
+// (#12): concurrency caps how many run *at once*, rate limiting caps how many
+// *start per window*. Enforced in the claim query (repositories.ts
+// `claimNextStep`) under a per-key advisory lock, with window math + validation
+// helpers in control/ratelimit.ts. A step with no `rateLimit` is unlimited.
+export interface RateLimit {
+  /** Steps sharing this key contend for the same window budget, across all runs. */
+  key: string
+  /** Max starts allowed per window. Must be >= 1. */
+  limit: number
+  /** Window length in milliseconds. Must be >= 1. */
+  windowMs: number
+}
+
 export interface StepDefinition {
   name: string
   dependsOn: string[]
   maxAttempts: number
   timeoutMs?: number
   priority: number
+  /** Concurrency cap for this step (#12). Absent = unlimited. */
+  concurrency?: ConcurrencyLimit
+  /** Rate cap for this step (#13). Absent = unlimited. */
+  rateLimit?: RateLimit
 }
 
 export interface WorkflowDefinition {

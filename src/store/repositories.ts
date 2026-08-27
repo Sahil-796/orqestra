@@ -5,7 +5,7 @@
 import type postgres from 'postgres'
 import type { Db } from './client.ts'
 import { withTransaction } from './client.ts'
-import type { RunStatus, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
+import type { RunStatus, ScheduleKind, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
 import { encodeResult, ok, type Result } from '../types.ts'
 
 function toJson(value: unknown): postgres.JSONValue {
@@ -33,6 +33,8 @@ export interface RunRow {
   started_at: Date | null
   finished_at: Date | null
   cancel_requested_at: Date | null
+  parent_run_id: string | null
+  parent_step_id: string | null
 }
 
 export interface StepRow {
@@ -50,11 +52,30 @@ export interface StepRow {
   lease_expires_at: Date | null
   timeout_ms: number | null
   priority: number
+  // Phase 6 (#12): declared concurrency cap, persisted onto the row so the
+  // claim query is self-contained. Both null = unlimited (the common case).
+  concurrency_key: string | null
+  concurrency_limit: number | null
+  // Phase 6 (#13): declared rate cap, persisted onto the row so the claim query
+  // is self-contained. All three null = unlimited (the common case).
+  rate_key: string | null
+  rate_limit: number | null
+  rate_window_ms: number | null
   reclaim_count: number
   sleep_seq: number
   sleeping_until: Date | null
   created_at: Date
   updated_at: Date
+  satisfied_deps: string[]
+  skip_reason: string | null
+  awaited_child_run_id: string | null
+  // Phase 5 (#18): what a `blocked` step is waiting for, if it's waiting on
+  // an event rather than a child run. `event_seq`/`event_payloads` are the
+  // replay-delivery pair, mirroring `sleep_seq` — see 0005's column comments.
+  waiting_event_name: string | null
+  waiting_event_correlation: string | null
+  event_seq: number
+  event_payloads: unknown[]
 }
 
 export interface HistoryRow {
@@ -111,6 +132,12 @@ export async function getWorkflowByName(
 // same key does not insert a second row. `created` tells the caller whether
 // this call actually inserted the row (and therefore whether steps still
 // need to be materialized) or found a pre-existing run for that key.
+//
+// `parentRunId`/`parentStepId` (Phase 4, #20 child workflows) are additive
+// and optional: pass both together when this run is a child spawned by a
+// step of another run, so `run.parent_run_id`/`run.parent_step_id` link it
+// back. Every existing caller that omits them behaves exactly as before —
+// both columns default to null.
 export async function createRun(
   sql: Db,
   input: {
@@ -119,17 +146,21 @@ export async function createRun(
     priority?: number
     input?: unknown
     idempotencyKey?: string
+    parentRunId?: string
+    parentStepId?: string
   }
 ): Promise<{ run: RunRow; created: boolean }> {
   if (input.idempotencyKey === undefined) {
     const rows = await sql<RunRow[]>`
-      insert into run (workflow_id, namespace, priority, input, idempotency_key)
+      insert into run (workflow_id, namespace, priority, input, idempotency_key, parent_run_id, parent_step_id)
       values (
         ${input.workflowId},
         ${input.namespace ?? 'default'},
         ${input.priority ?? 0},
         ${input.input === undefined ? null : sql.json(toJson(input.input))},
-        ${null}
+        ${null},
+        ${input.parentRunId ?? null},
+        ${input.parentStepId ?? null}
       )
       returning *
     `
@@ -139,13 +170,15 @@ export async function createRun(
   }
 
   const inserted = await sql<RunRow[]>`
-    insert into run (workflow_id, namespace, priority, input, idempotency_key)
+    insert into run (workflow_id, namespace, priority, input, idempotency_key, parent_run_id, parent_step_id)
     values (
       ${input.workflowId},
       ${input.namespace ?? 'default'},
       ${input.priority ?? 0},
       ${input.input === undefined ? null : sql.json(toJson(input.input))},
-      ${input.idempotencyKey}
+      ${input.idempotencyKey},
+      ${input.parentRunId ?? null},
+      ${input.parentStepId ?? null}
     )
     on conflict (idempotency_key) do nothing
     returning *
@@ -220,6 +253,89 @@ export async function getIncompleteRuns(sql: Db): Promise<RunRow[]> {
   `
 }
 
+// ---- child workflows (#20) -------------------------------------------------
+//
+// A child run is an ordinary `run` row (created via `createRun` with
+// `parentRunId`/`parentStepId` set) plus a step, somewhere in the parent
+// run, that is durably waiting on it. "Durably" is the operative word: the
+// parent step does not hold its worker lease for however long the child
+// takes (see 0004_orchestration.sql's rationale for `status = 'blocked'`) —
+// it releases back to storage the same way a sleeping step does, and is
+// woken by `resolveBlockedStepForChildRun` once the child finishes.
+
+// Every run spawned as a child of `parentRunId`, in creation order —
+// observability and the "await all children" shape both want this.
+export async function getChildRuns(sql: Db, parentRunId: string): Promise<RunRow[]> {
+  return sql<RunRow[]>`
+    select * from run where parent_run_id = ${parentRunId} order by created_at
+  `
+}
+
+// The step-side half of spawning a child run: park the step that spawned it
+// in `blocked` and record which child it's waiting on, releasing the lease
+// exactly like `sleepStep` (0003) does for a sleep — same fencing (only the
+// current lease holder may do this), same "give the worker back" shape, so
+// a long-running child (which may itself sleep, retry, or fan out) never
+// pins a worker slot for its whole lifetime. The attempt decrement is
+// `sleepStep`'s reasoning verbatim: claiming the step consumed an attempt,
+// but suspending to await a child is not a failed try, so give it back —
+// otherwise a step that awaits N children in sequence silently burns N of
+// its `max_attempts` budget and dies of retry exhaustion without ever
+// having thrown.
+export async function blockStepOnChildRun(
+  sql: Db,
+  args: { stepId: string; workerId: string; childRunId: string }
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'blocked',
+      awaited_child_run_id = ${args.childRunId},
+      attempt = greatest(attempt - 1, 0),
+      lease_owner = null,
+      lease_expires_at = null,
+      updated_at = now()
+    where id = ${args.stepId} and status = 'running' and lease_owner = ${args.workerId}
+    returning *
+  `
+  return rows[0]
+}
+
+// The wake side: called once a child run has reached a terminal status.
+// Finds the `blocked` step (if any) waiting on exactly this child — via
+// `awaited_child_run_id`, backed by `step_awaited_child_run_id_idx` — and
+// releases it back to `ready`, clearing the link. No lease to re-check
+// here: nobody holds one while a step is `blocked`, the same way nobody
+// holds one while a step is asleep. The step function replays from the top
+// on its next claim (the established replay contract — see 0003's
+// `sleepStep`) and reads the child's outcome via `getRun(childRunId)` or
+// `getChildRuns(parentRunId)`, exactly as a woken sleep re-reads
+// `sleep_seq` to know it's already served its sleep. The `exists` guard
+// means calling this before the child is actually terminal is a safe no-op,
+// not a premature release.
+export async function resolveBlockedStepForChildRun(
+  sql: Db,
+  childRunId: string
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'ready',
+      awaited_child_run_id = null,
+      -- Aging (#14) measures from run_after; a step becomes ready here after
+      -- waiting on a child, so start its age from now() rather than the stale
+      -- creation-time value.
+      run_after = now(),
+      updated_at = now()
+    where awaited_child_run_id = ${childRunId}
+      and status = 'blocked'
+      and exists (
+        select 1 from run
+        where id = ${childRunId} and status in ('completed', 'failed', 'cancelled')
+      )
+    returning *
+  `
+  return rows[0]
+}
+
 // ---- step ----------------------------------------------------------------
 //
 // Step `result` is persisted as an encoded `Result<T>` (`{ ok: true, value }`
@@ -237,6 +353,17 @@ export interface NewStep {
   timeoutMs?: number
   priority: number
   status: StepStatus
+  // Phase 6 (#12): optional concurrency cap. Both omitted = unlimited. When
+  // present they must agree (key + positive limit) — the DB CHECK
+  // (0006_flow_control.sql) rejects a half-declared pair.
+  concurrencyKey?: string
+  concurrencyLimit?: number
+  // Phase 6 (#13): optional rate cap. All omitted = unlimited. When present they
+  // must agree (key + positive limit + positive window) — the DB CHECK
+  // (0007_rate_limiting.sql) rejects a partially-declared triple.
+  rateKey?: string
+  rateLimit?: number
+  rateWindowMs?: number
 }
 
 export async function insertSteps(sql: Db, runId: string, steps: NewStep[]): Promise<StepRow[]> {
@@ -248,6 +375,11 @@ export async function insertSteps(sql: Db, runId: string, steps: NewStep[]): Pro
     max_attempts: step.maxAttempts,
     timeout_ms: step.timeoutMs ?? null,
     priority: step.priority,
+    concurrency_key: step.concurrencyKey ?? null,
+    concurrency_limit: step.concurrencyLimit ?? null,
+    rate_key: step.rateKey ?? null,
+    rate_limit: step.rateLimit ?? null,
+    rate_window_ms: step.rateWindowMs ?? null,
     depends_on: step.dependsOn,
   }))
   return sql<StepRow[]>`
@@ -321,6 +453,117 @@ export async function resetRunningSteps(sql: Db, runId: string): Promise<void> {
   `
 }
 
+// ---- DAG: dependencies, fan-in, conditional branching (#15/#16/#17/#19) --
+//
+// engine/scheduler.ts's `newlyReadySteps` (Phase 1) already computes
+// readiness correctly by re-reading a run's whole step set under `lockRun`
+// — that stays the default path and this file does not change it. What's
+// added here is a second, narrower primitive for the case that rescan
+// approach makes expensive: a step with many fan-in parents, each
+// completing in its own worker's transaction. `recordDependencySatisfied`
+// lets each parent's completion touch only the one dependent row, and is
+// safe under concurrency without the run-level lock (see the migration
+// comment on `satisfied_deps` for why).
+
+// Every sibling step, in the same run, that `stepId` names in its
+// `depends_on` — i.e. its dependency set, resolved to full rows so a caller
+// can read their current status. Returns them in `depends_on` order isn't
+// guaranteed (the join has no ordering guarantee across dependency names),
+// so callers that care about order should re-sort by name themselves.
+export async function getDependencySteps(sql: Db, stepId: string): Promise<StepRow[]> {
+  return sql<StepRow[]>`
+    select dep.* from step s
+    join step dep on dep.run_id = s.run_id and dep.name = any(s.depends_on)
+    where s.id = ${stepId}
+  `
+}
+
+// Record that one of `stepId`'s named dependencies (`depName`) has
+// resolved — because it completed, or because it was skipped and the
+// caller has decided a skip counts as "satisfied" for this edge; this
+// function doesn't judge why, it just tracks which names have resolved and
+// releases the step the instant every name in `depends_on` is among them.
+//
+// One UPDATE statement, not a chain of two CTEs writing the same table:
+// Postgres data-modifying CTEs all execute against the snapshot taken at
+// the start of the command, so a second CTE cannot see a first CTE's
+// write to the very same row within one statement (empirically: it
+// matches zero rows, silently, rather than erroring — this was caught by
+// this file's own tests, not by the docs). Computing the new
+// `satisfied_deps` once via a scalar subquery and reusing it for both the
+// SET and the readiness CASE keeps this a single write to a single row,
+// which is exactly what makes it race-safe: the whole
+// read-append-maybe-release sequence is one row-level lock acquired and
+// released by Postgres itself, no application-level read-then-write, so
+// there is no window for two concurrent callers to both observe "not yet
+// satisfied" and neither one flip the step to `ready` (the fan-in bug this
+// exists to rule out), and no deadlock (each call only ever touches the
+// one row it's updating, for the lifetime of this one statement).
+//
+// Returns the step's current row whether or not this call was the one that
+// released it — check `.status === 'ready'` to tell those apart. Returns
+// undefined if the step wasn't `pending` (already released by an earlier
+// call, or not a dependency-gated step at all) — a safe no-op, not an
+// error, since a duplicate delivery of the same dependency's resolution
+// should not be able to do anything.
+export async function recordDependencySatisfied(
+  sql: Db,
+  stepId: string,
+  depName: string
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step
+    set
+      satisfied_deps = (
+        select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+      ),
+      status = case
+        when depends_on <@ (
+          select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+        ) then 'ready'
+        else status
+      end,
+      -- Priority aging (#14) ages from run_after, so reset it to now() at the
+      -- moment the step becomes ready — otherwise a deep-DAG step inherits its
+      -- creation-time run_after and lands with a large age (instant max boost)
+      -- despite having waited 0s in the ready queue.
+      run_after = case
+        when depends_on <@ (
+          select array_agg(distinct d) from unnest(satisfied_deps || array[${depName}]::text[]) as d
+        ) then now()
+        else run_after
+      end,
+      updated_at = now()
+    where id = ${stepId} and status = 'pending'
+    returning *
+  `
+  return rows[0]
+}
+
+// Feature #17: mark a step as never going to run because the conditional
+// branch it belongs to was not taken. Terminal, but distinct from
+// `failed`/`cancelled` (see 0004_orchestration.sql) — nothing went wrong,
+// nothing was asked to stop, the workflow's own logic decided this path.
+// Allowed from `pending` or `ready` (a step can be skipped either before or
+// after its dependencies resolved, depending on when the branch decision
+// itself becomes known) but not from `running`/terminal states — those
+// need their own resolution path, not to be silently overwritten.
+export async function skipStep(
+  sql: Db,
+  stepId: string,
+  reason?: string
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'skipped',
+      skip_reason = ${reason ?? null},
+      updated_at = now()
+    where id = ${stepId} and status in ('pending', 'ready')
+    returning *
+  `
+  return rows[0]
+}
+
 // ---- queue: claim / lease / retry -----------------------------------------
 //
 // Phase 2 turns the step table into a claimable queue. Everything here is
@@ -333,6 +576,14 @@ export interface ClaimStepOptions {
   workerId: string
   leaseTtlMs: number
   namespace?: string
+  // Phase 6 (#14) priority aging. `priorityAgeRatePerSec` priority points are
+  // added to a step's base priority per second it has been ready (age measured
+  // from `run_after`), capped at `priorityAgeMaxBoost`. Both default to 0, which
+  // disables aging and makes the claim order by `priority desc, run_after` —
+  // exactly the pre-Phase-6 behaviour. queue/claim.ts fills these from config so
+  // the worker path gets aging without every caller passing them.
+  priorityAgeRatePerSec?: number
+  priorityAgeMaxBoost?: number
 }
 
 // The queue claim, straight from the build plan: SKIP LOCKED lets any
@@ -345,10 +596,60 @@ export interface ClaimStepOptions {
 // between. `attempt` is incremented here, at claim time, because it counts
 // real execution attempts — retryStep (below) only resets state, it never
 // touches attempt.
+// Priority aging (#14) and concurrency limits (#12) both land in this one
+// transaction. Aging is a pure ordering change: the candidate SELECT orders by
+// an *effective* priority — `priority + least(maxBoost, age_seconds * rate)`,
+// where `age_seconds = extract(epoch from (now() - run_after))` — so a
+// low-priority step that has been ready long enough climbs past fresh
+// high-priority work instead of starving behind it. With rate 0 (the default)
+// the boost is always 0 and this is exactly `order by priority desc, run_after`.
+//
+// Concurrency is the hard part. A step may carry a `concurrency_key` + `limit`,
+// and is only claimable while fewer than `limit` steps sharing that key are
+// `running`. The naive guard — a correlated `count(*) < limit` in the WHERE —
+// is NOT safe under concurrent claimers: two workers each running this
+// transaction can both read "4 running < 5" (neither sees the other's
+// uncommitted flip-to-running) and both claim, pushing 6 running. We close that
+// race with `pg_advisory_xact_lock(hashtext(key))`: the first worker to reach a
+// given key holds that lock until it commits, so a second worker requesting the
+// same key BLOCKS until the first commits and only then re-counts — and because
+// we run at READ COMMITTED, that post-lock count is a fresh snapshot that sees
+// the first worker's committed flip. Chosen over a per-key counter row because
+// it needs no extra table, self-heals (an xact lock is released on commit/abort
+// even if the worker crashes mid-claim), and serializes only same-key claims —
+// different keys, and the un-keyed fast path, never contend.
+//
+// The candidate SELECT still applies a best-effort `count(*) < limit` filter so
+// a *full* key's steps are skipped in favour of other claimable work (otherwise
+// a full high-priority key would be picked every tick and block everything
+// behind it). That pre-filter can be stale under a race; the advisory-locked
+// recount below is the authority. When the recount finds the key full we claim
+// nothing this tick and the step stays `ready`, retried next poll — never
+// failed or deferred destructively.
+//
+// Rate limiting (#13) is the third gate to land here, and it uses the same
+// advisory-lock serialization as concurrency but a different window model and a
+// different "budget exhausted" response. A step may carry a `rate_key` + `limit`
+// + `window_ms`: at most `limit` steps sharing that key may START within any one
+// fixed window. We take `pg_advisory_xact_lock(hashtext(rate_key))` (so
+// count-and-consume is atomic per key — two workers can't both see budget and
+// both consume it), then upsert-increment the (rate_key, window_start) counter
+// in `rate_window`, where `window_start = floor(now_ms / window_ms) * window_ms`
+// against the DB clock (mirrored by control/ratelimit.ts's windowStartMs). The
+// conditional ON CONFLICT ... WHERE count < limit makes the whole check atomic:
+// it returns a row iff budget remained. If budget is EXHAUSTED we do NOT claim
+// this tick and, unlike concurrency (where the step stays plainly `ready` and is
+// retried on the next poll), we DEFER the step — push its `run_after` to the
+// next window boundary — so the worker doesn't hot-spin re-checking a step whose
+// key can't grant a start until the window rolls over. The step is never lost or
+// failed; it simply becomes claimable again when fresh budget exists.
+// Null rate key = unlimited: the un-keyed fast path never touches rate_window.
 export async function claimNextStep(
   sql: Db,
   options: ClaimStepOptions
 ): Promise<StepRow | undefined> {
+  const rate = options.priorityAgeRatePerSec ?? 0
+  const maxBoost = options.priorityAgeMaxBoost ?? 0
   return withTransaction(sql, async (tx) => {
     const namespaceFilter = options.namespace ? tx`and r.namespace = ${options.namespace}` : tx``
     const candidates = await tx<StepRow[]>`
@@ -358,13 +659,103 @@ export async function claimNextStep(
         and s.run_after <= now()
         and (s.lease_expires_at is null or s.lease_expires_at < now())
         and r.status in ('queued', 'running')
+        and (
+          s.concurrency_key is null
+          or (
+            select count(*) from step rs
+            where rs.concurrency_key = s.concurrency_key and rs.status = 'running'
+          ) < s.concurrency_limit
+        )
+        and (
+          s.rate_key is null
+          or coalesce((
+            select count from rate_window
+            where rate_key = s.rate_key
+              and window_start = floor(extract(epoch from now()) * 1000 / s.rate_window_ms) * s.rate_window_ms
+          ), 0) < s.rate_limit
+        )
         ${namespaceFilter}
-      order by s.priority desc, s.run_after
+      order by
+        (s.priority + least(
+          ${maxBoost}::float8,
+          greatest(0, extract(epoch from (now() - s.run_after)) * ${rate}::float8)
+        )) desc,
+        s.run_after
       for update of s skip locked
       limit 1
     `
     const candidate = candidates[0]
     if (!candidate) return undefined
+
+    // Acquire the candidate's per-key advisory locks up front, in one global
+    // order (sorted by the key string). A step may carry BOTH a concurrency
+    // key and a rate key; taking them in a fixed order for every claim is what
+    // stops two claims whose concurrency/rate keys are crossed from deadlocking
+    // (each holding one and waiting on the other). Distinct keys only — an
+    // xact advisory lock is re-entrant, but deduping keeps it obvious. Held
+    // until commit; the concurrency recount and the rate consume below both run
+    // under whichever of these locks they need.
+    const lockKeys = [candidate.concurrency_key, candidate.rate_key].filter(
+      (k): k is string => k !== null
+    )
+    for (const key of [...new Set(lockKeys)].sort()) {
+      await tx`select pg_advisory_xact_lock(hashtext(${key}))`
+    }
+
+    // Keyed candidate: re-check the count under the advisory lock (already held
+    // above) — this is the authoritative gate, the WHERE filter above is only a
+    // best-effort skip of full keys.
+    if (candidate.concurrency_key !== null) {
+      const counts = await tx<{ running: string }[]>`
+        select count(*)::text as running from step
+        where concurrency_key = ${candidate.concurrency_key} and status = 'running'
+      `
+      const running = Number(counts[0]?.running ?? 0)
+      const limit = candidate.concurrency_limit ?? Number.POSITIVE_INFINITY
+      if (running >= limit) return undefined
+    }
+
+    // Keyed by a rate limit: count-and-consume the current window's budget under
+    // the advisory lock (already held above). Runs AFTER the concurrency gate on
+    // purpose — the concurrency check has no side effect, so a step blocked by a
+    // full concurrency key must not have burned a rate token it never got to
+    // use. Consuming here is the authoritative "this start happened"; if the
+    // window is exhausted we defer instead of claiming.
+    if (
+      candidate.rate_key !== null &&
+      candidate.rate_limit !== null &&
+      candidate.rate_window_ms !== null
+    ) {
+      const rateKey = candidate.rate_key
+      const rateLimit = candidate.rate_limit
+      const windowMs = candidate.rate_window_ms
+      const consumed = await tx<{ count: number }[]>`
+        insert into rate_window (rate_key, window_start, count)
+        values (
+          ${rateKey},
+          (floor(extract(epoch from now()) * 1000 / ${windowMs}) * ${windowMs})::bigint,
+          1
+        )
+        on conflict (rate_key, window_start) do update
+          set count = rate_window.count + 1
+          where rate_window.count < ${rateLimit}
+        returning count
+      `
+      if (!consumed[0]) {
+        // Window exhausted: defer to the next window boundary (DB clock, mirrors
+        // ratelimit.ts's nextWindowStartMs) so this step isn't re-checked every
+        // poll until fresh budget exists. Not failed, not lost — just not now.
+        await tx`
+          update step set
+            run_after = to_timestamp(
+              (floor(extract(epoch from now()) * 1000 / ${windowMs}) + 1) * ${windowMs} / 1000.0
+            ),
+            updated_at = now()
+          where id = ${candidate.id}
+        `
+        return undefined
+      }
+    }
 
     const claimed = await tx<StepRow[]>`
       update step set
@@ -528,12 +919,27 @@ export async function retryStep(
 // Called when a run is being failed/cancelled so its remaining unclaimed
 // steps stop being claimable — otherwise a worker could pick one up after
 // the run is already decided, doing wasted (or worse, order-dependent)
-// work on a run that's over. Only pending/ready are touched; running steps
-// are left for their worker (or the reclaim sweep) to resolve on its own.
+// work on a run that's over. Only pending/ready/blocked are touched;
+// running steps are left for their worker (or the reclaim sweep) to resolve
+// on its own.
+//
+// `blocked` (Phase 4 #20) has to be in that list for the same reason
+// `pending` is, and it is easy to miss because a blocked step looks inert:
+// nobody holds its lease, so it reads like a step that has already stopped.
+// It hasn't. It is still waiting on a child run, and when that child reaches
+// a terminal status `resolveBlockedStepForChildRun` flips it back to
+// `ready` — which, if the parent run was cancelled in the meantime, means
+// resurrecting a claimable step inside a run that is already over. Cancel it
+// here, and the wake's `where status = 'blocked'` guard no longer matches.
 export async function cancelPendingSteps(sql: Db, runId: string): Promise<StepRow[]> {
   return sql<StepRow[]>`
-    update step set status = 'cancelled', updated_at = now()
-    where run_id = ${runId} and status in ('pending', 'ready')
+    update step set
+      status = 'cancelled',
+      awaited_child_run_id = null,
+      waiting_event_name = null,
+      waiting_event_correlation = null,
+      updated_at = now()
+    where run_id = ${runId} and status in ('pending', 'ready', 'blocked')
     returning *
   `
 }
@@ -677,9 +1083,18 @@ export async function finalizeCancelledRun(
       return { run: undefined, cancelledSteps: [] }
     }
 
+    // 'blocked' included for the reason spelled out on cancelPendingSteps:
+    // a step awaiting a child is not finished, it is suspended, and leaving
+    // it alone lets the child's terminal write wake it back into a run that
+    // has already been cancelled.
     const cancelledSteps = await tx<StepRow[]>`
-      update step set status = 'cancelled', updated_at = now()
-      where run_id = ${runId} and status in ('pending', 'ready')
+      update step set
+        status = 'cancelled',
+        awaited_child_run_id = null,
+        waiting_event_name = null,
+        waiting_event_correlation = null,
+        updated_at = now()
+      where run_id = ${runId} and status in ('pending', 'ready', 'blocked')
       returning *
     `
 
@@ -758,4 +1173,482 @@ export async function insertHistory(
   const row = rows[0]
   if (!row) throw new Error('insertHistory: insert returned no row')
   return row
+}
+
+// ---- signals & events (#18) -----------------------------------------------
+//
+// The events log is append-only (0005_signals_triggers.sql). `publishEvent`
+// is the single durable entry point for putting a signal into the system —
+// control/signal.ts (users + the CLI), Agent 2 (webhook ingress) and Agent 3
+// (event triggers) all funnel through it. It does two things atomically:
+// records the event, and wakes every `blocked` step whose recorded wait
+// matches. The wake is exactly-once by construction (the WHERE clause on the
+// UPDATE only touches steps that are still `blocked`, so a step that has
+// already been woken — or woken by a concurrent publish — is invisible to a
+// second matching publish).
+
+export interface EventRow {
+  id: string
+  name: string
+  correlation_key: string | null
+  payload: unknown
+  source: string
+  idempotency_key: string | null
+  created_at: Date
+  dispatched_at: Date | null
+}
+
+export interface PublishEventInput {
+  name: string
+  /** Narrows which waiters wake — only those with a matching (or absent) correlation. */
+  correlationKey?: string
+  payload?: unknown
+  /** Provenance label stored on the row — 'api' | 'webhook' | 'trigger' | … Defaults to 'api'. */
+  source?: string
+  /** Publish-side dedup: a repeat publish with the same key is a no-op (no second row, no second wake). */
+  idempotencyKey?: string
+}
+
+export interface PublishEventResult {
+  event: EventRow
+  /** False when `idempotencyKey` matched an existing event — nothing new was inserted or woken. */
+  created: boolean
+  /** Every `blocked` step this publish moved back to `ready`. */
+  woken: StepRow[]
+}
+
+// Wake every blocked step whose recorded wait matches this event, delivering
+// `payload` to each (appended to `event_payloads`, `event_seq` bumped so the
+// replayed context returns it). The matching rule, from the event's side:
+// wake a waiter whose name matches AND whose correlation is either absent (a
+// broad waiter, woken by any event of that name) or equal to the event's
+// correlation. A correlated waiter is therefore never woken by an
+// uncorrelated event, and never by an event with a different correlation.
+//
+// Exactly-once lives in the `status = 'blocked'` guard: the UPDATE flips the
+// step to `ready` in the same statement, so the row leaves the matched set
+// atomically and no second matching publish (or the throw->block backstop)
+// can wake or double-deliver to it.
+export async function wakeStepsWaitingForEvent(
+  sql: Db,
+  args: { name: string; correlationKey?: string; payload?: unknown }
+): Promise<StepRow[]> {
+  const payloadJson = sql.json(toJson(args.payload ?? null))
+  return sql<StepRow[]>`
+    update step set
+      status = 'ready',
+      waiting_event_name = null,
+      waiting_event_correlation = null,
+      event_seq = event_seq + 1,
+      event_payloads = event_payloads || jsonb_build_array(${payloadJson}),
+      -- Aging (#14) measures from run_after; a step becomes ready here after
+      -- waiting for its event, so start its age from now() rather than the
+      -- stale creation-time value.
+      run_after = now(),
+      updated_at = now()
+    where status = 'blocked'
+      and waiting_event_name = ${args.name}
+      and (waiting_event_correlation is null or waiting_event_correlation = ${args.correlationKey ?? null})
+    returning *
+  `
+}
+
+// The single durable entry point for publishing a signal. Insert the event
+// (idempotently when a key is supplied), then wake matching waiters — both in
+// one transaction so an event is never recorded without its wake, nor a wake
+// applied without the durable record behind it. A redelivery (same
+// idempotency key) inserts nothing and wakes nothing: the first publish
+// already woke whoever was waiting, and re-waking on a duplicate is precisely
+// the double-delivery the key exists to prevent.
+export async function publishEvent(
+  sql: Db,
+  input: PublishEventInput
+): Promise<PublishEventResult> {
+  return withTransaction(sql, async (tx) => {
+    let event: EventRow
+    let created: boolean
+
+    if (input.idempotencyKey === undefined) {
+      const rows = await tx<EventRow[]>`
+        insert into events (name, correlation_key, payload, source, idempotency_key)
+        values (
+          ${input.name},
+          ${input.correlationKey ?? null},
+          ${input.payload === undefined ? null : tx.json(toJson(input.payload))},
+          ${input.source ?? 'api'},
+          ${null}
+        )
+        returning *
+      `
+      const row = rows[0]
+      if (!row) throw new Error('publishEvent: insert returned no row')
+      event = row
+      created = true
+    } else {
+      const inserted = await tx<EventRow[]>`
+        insert into events (name, correlation_key, payload, source, idempotency_key)
+        values (
+          ${input.name},
+          ${input.correlationKey ?? null},
+          ${input.payload === undefined ? null : tx.json(toJson(input.payload))},
+          ${input.source ?? 'api'},
+          ${input.idempotencyKey}
+        )
+        on conflict (idempotency_key) do nothing
+        returning *
+      `
+      const insertedRow = inserted[0]
+      if (insertedRow) {
+        event = insertedRow
+        created = true
+      } else {
+        const existing = await tx<EventRow[]>`
+          select * from events where idempotency_key = ${input.idempotencyKey}
+        `
+        const existingRow = existing[0]
+        if (!existingRow) throw new Error('publishEvent: idempotency conflict but no existing row found')
+        return { event: existingRow, created: false, woken: [] }
+      }
+    }
+
+    const woken = await wakeStepsWaitingForEvent(tx, {
+      name: input.name,
+      correlationKey: input.correlationKey,
+      payload: input.payload,
+    })
+    return { event, created, woken }
+  })
+}
+
+// Suspend a running step waiting for an event. Fenced on lease ownership
+// exactly like sleepStep / blockStepOnChildRun: the WHERE clause only matches
+// while this worker still owns a `running` lease, so a worker whose lease was
+// reclaimed underneath it writes nothing. `attempt - 1` gives back the
+// attempt that claiming consumed — a wait is not a failed try — same as sleep
+// and child-block. The lease is cleared as part of parking the row, so no
+// separate releaseStep is needed.
+// `workerId` fences on lease ownership (the worker path); omit it for the
+// inline single-process driver (engine/executor.ts), which holds no lease —
+// there the `status = 'running'` guard alone is the whole safety story, since
+// nothing else is touching the row.
+export async function registerStepEventWait(
+  sql: Db,
+  args: { stepId: string; eventName: string; correlationKey?: string; workerId?: string }
+): Promise<StepRow | undefined> {
+  const rows = await sql<StepRow[]>`
+    update step set
+      status = 'blocked',
+      waiting_event_name = ${args.eventName},
+      waiting_event_correlation = ${args.correlationKey ?? null},
+      attempt = greatest(attempt - 1, 0),
+      lease_owner = null,
+      lease_expires_at = null,
+      updated_at = now()
+    where id = ${args.stepId} and status = 'running'
+      and (${args.workerId ?? null}::text is null or lease_owner = ${args.workerId ?? null})
+    returning *
+  `
+  return rows[0]
+}
+
+// The throw->block race backstop. A step decides to wait and throws its
+// signal; a matching event can be published in the window before the worker
+// commits the `blocked` row, and `publishEvent`'s live wake would miss it
+// (the step is still `running`, not yet `blocked`). So the block commit,
+// after writing the `blocked` row, asks whether a matching event already
+// landed at or after this attempt began (`since`) — if so it wakes itself in
+// place. `since` is the worker's attempt-start instant; an event from before
+// this attempt is deliberately excluded (no unbounded backlog replay). See
+// worker.ts's commitEventWait for the full ordering argument.
+export async function findMatchingEventSince(
+  sql: Db,
+  args: { name: string; correlationKey?: string; since: Date }
+): Promise<EventRow | undefined> {
+  const rows = await sql<EventRow[]>`
+    select * from events
+    where name = ${args.name}
+      and (${args.correlationKey ?? null}::text is null or correlation_key = ${args.correlationKey ?? null})
+      and created_at >= ${args.since}
+    order by created_at, id
+    limit 1
+  `
+  return rows[0]
+}
+
+// Observability / tests: which steps are parked waiting for an event right
+// now (as opposed to blocked on a child run — both are `blocked`, only the
+// waiting_event_name / awaited_child_run_id columns tell them apart).
+export async function getStepsWaitingForEvent(sql: Db, runId?: string): Promise<StepRow[]> {
+  const runFilter = runId ? sql`and run_id = ${runId}` : sql``
+  return sql<StepRow[]>`
+    select * from step
+    where status = 'blocked' and waiting_event_name is not null
+      ${runFilter}
+    order by updated_at
+  `
+}
+
+// ---- event-trigger routing (Agent 3) --------------------------------------
+//
+// The trigger daemon claims undispatched events, maps them to
+// event-triggered workflows, starts runs, and stamps `dispatched_at` so each
+// event is routed at most once. `claimUndispatchedEvents` does the claim
+// atomically (FOR UPDATE SKIP LOCKED + stamp) so two daemon instances never
+// both route the same event.
+
+export async function claimUndispatchedEvents(sql: Db, limit = 100): Promise<EventRow[]> {
+  return sql<EventRow[]>`
+    update events set dispatched_at = now()
+    where id in (
+      select id from events
+      where dispatched_at is null
+      order by created_at, id
+      for update skip locked
+      limit ${limit}
+    )
+    returning *
+  `
+}
+
+// Non-claiming read, for observability or a daemon that wants to inspect
+// before it routes. `claimUndispatchedEvents` is the one to drive routing.
+export async function getUndispatchedEvents(sql: Db, limit = 100): Promise<EventRow[]> {
+  return sql<EventRow[]>`
+    select * from events where dispatched_at is null
+    order by created_at, id
+    limit ${limit}
+  `
+}
+
+// Undo a dispatch stamp so a later poll re-claims the event. Used when routing
+// a claimed event to its workflows partially failed: resetting dispatched_at
+// lets the next tick retry, and the per-(event, workflow) idempotency key keeps
+// already-started workflows from starting twice.
+export async function resetEventDispatch(sql: Db, eventId: string): Promise<void> {
+  await sql`update events set dispatched_at = null where id = ${eventId}`
+}
+
+// ---- schedules: time-based starts (Agents 2 & 3) --------------------------
+
+export interface ScheduleRow {
+  id: string
+  workflow_name: string
+  kind: ScheduleKind
+  cron_expression: string | null
+  next_run_at: Date
+  input: unknown
+  namespace: string
+  priority: number
+  enabled: boolean
+  last_fired_at: Date | null
+  created_at: Date
+  updated_at: Date
+}
+
+export interface CreateScheduleInput {
+  workflowName: string
+  kind: ScheduleKind
+  /** Required when `kind` is 'cron', rejected (by the CHECK) when 'once'. */
+  cronExpression?: string
+  nextRunAt: Date
+  input?: unknown
+  namespace?: string
+  priority?: number
+  enabled?: boolean
+}
+
+// Register a schedule row. Agent 2 uses this for delayed / one-shot starts
+// ('once'); Agent 3 for cron registration. The cron-expression/kind
+// coherence is enforced by the DB CHECK, so a 'cron' with no expression (or
+// a 'once' with one) fails loudly here rather than misbehaving in the poller.
+export async function createSchedule(sql: Db, input: CreateScheduleInput): Promise<ScheduleRow> {
+  const rows = await sql<ScheduleRow[]>`
+    insert into schedules (workflow_name, kind, cron_expression, next_run_at, input, namespace, priority, enabled)
+    values (
+      ${input.workflowName},
+      ${input.kind},
+      ${input.cronExpression ?? null},
+      ${input.nextRunAt},
+      ${input.input === undefined ? null : sql.json(toJson(input.input))},
+      ${input.namespace ?? 'default'},
+      ${input.priority ?? 0},
+      ${input.enabled ?? true}
+    )
+    returning *
+  `
+  const row = rows[0]
+  if (!row) throw new Error('createSchedule: insert returned no row')
+  return row
+}
+
+export async function getSchedule(sql: Db, id: string): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`select * from schedules where id = ${id}`
+  return rows[0]
+}
+
+// Durable existence check for a workflow's cron schedule. syncCronSchedules
+// uses this to stay idempotent across process *restarts*: its in-memory guard
+// only covers the current process, so without a persisted check a fresh process
+// would insert a second cron row for the same workflow+expression and the
+// schedule would fire twice. Matches on the enabled cron row only.
+export async function findCronSchedule(
+  sql: Db,
+  workflowName: string,
+  cronExpression: string
+): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    select * from schedules
+    where kind = 'cron'
+      and enabled
+      and workflow_name = ${workflowName}
+      and cron_expression = ${cronExpression}
+    order by created_at
+    limit 1
+  `
+  return rows[0]
+}
+
+// The poller's atomic claim. Returns due, enabled schedules and, in the same
+// statement, pushes their `next_run_at` forward by `guardMs` so a second
+// poller (or the same poller on its next tick, before this batch has been
+// fired and rescheduled) does not re-claim them. The caller then fires each
+// run and calls `rescheduleCron` (sets the real next occurrence, overwriting
+// the guard bump) or `markScheduleFired` (disables a 'once'). FOR UPDATE SKIP
+// LOCKED keeps concurrent pollers from contending on the same rows.
+//
+// The guard bump is a safety net, not the schedule's real cadence: a poller
+// that claims and then crashes before rescheduling leaves the schedule due
+// again `guardMs` later, so nothing is lost — it just fires late.
+export async function claimDueSchedules(
+  sql: Db,
+  now: Date,
+  limit = 100,
+  guardMs = 60_000
+): Promise<ScheduleRow[]> {
+  return sql<ScheduleRow[]>`
+    update schedules set
+      next_run_at = ${now} + (${guardMs} * interval '1 millisecond'),
+      updated_at = now()
+    where id in (
+      select id from schedules
+      where enabled and next_run_at <= ${now}
+      order by next_run_at
+      for update skip locked
+      limit ${limit}
+    )
+    returning *
+  `
+}
+
+// Record that a schedule fired. For a 'once' schedule this also disables it —
+// a one-shot has done its job and must never fire again. For a 'cron'
+// schedule use `rescheduleCron` instead (it sets the next occurrence); calling
+// this on a cron would stop it dead.
+export async function markScheduleFired(sql: Db, id: string, firedAt: Date): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    update schedules set
+      last_fired_at = ${firedAt},
+      enabled = case when kind = 'once' then false else enabled end,
+      updated_at = now()
+    where id = ${id}
+    returning *
+  `
+  return rows[0]
+}
+
+// Advance a cron schedule to its next occurrence after firing. The caller
+// (Agent 3) computes `nextRunAt` from the cron expression — this layer does
+// no cron maths. Overwrites the guard bump `claimDueSchedules` applied.
+export async function rescheduleCron(
+  sql: Db,
+  id: string,
+  nextRunAt: Date,
+  firedAt: Date
+): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    update schedules set
+      next_run_at = ${nextRunAt},
+      last_fired_at = ${firedAt},
+      updated_at = now()
+    where id = ${id} and kind = 'cron'
+    returning *
+  `
+  return rows[0]
+}
+
+// Pause / resume a schedule without deleting it.
+export async function setScheduleEnabled(sql: Db, id: string, enabled: boolean): Promise<ScheduleRow | undefined> {
+  const rows = await sql<ScheduleRow[]>`
+    update schedules set enabled = ${enabled}, updated_at = now()
+    where id = ${id}
+    returning *
+  `
+  return rows[0]
+}
+
+// ---- start a run by workflow name (Agents 2 & 3) --------------------------
+//
+// The programmatic-trigger entry point. `enqueueRun`/`startRun`
+// (engine/executor.ts) need an in-process `WorkflowHandle` — fine for a step
+// spawning a child, wrong for a daemon that only knows a workflow *name* and
+// an input. This starts a run from the workflow's stored `dag` (the durable
+// `WorkflowDefinition`): register-free, no handle required. It materializes
+// the step rows exactly as `registerAndCreateRun` does, so any worker pool
+// that has the workflow registered drains it normally. Idempotent when
+// `idempotencyKey` is supplied, same as `createRun`.
+
+export interface StartRunByNameInput {
+  workflowName: string
+  version?: number
+  input?: unknown
+  namespace?: string
+  priority?: number
+  idempotencyKey?: string
+}
+
+export interface StartRunByNameResult {
+  runId: string
+  workflowId: string
+  created: boolean
+}
+
+export async function startRunForWorkflowName(
+  sql: Db,
+  input: StartRunByNameInput
+): Promise<StartRunByNameResult> {
+  const workflow = await getWorkflowByName(sql, input.workflowName, input.version)
+  if (!workflow) {
+    throw new Error(`startRunForWorkflowName: no workflow registered under name "${input.workflowName}"`)
+  }
+
+  return withTransaction(sql, async (tx) => {
+    const { run, created } = await createRun(tx, {
+      workflowId: workflow.id,
+      namespace: input.namespace,
+      priority: input.priority,
+      input: input.input,
+      idempotencyKey: input.idempotencyKey,
+    })
+
+    if (!created) return { runId: run.id, workflowId: workflow.id, created: false }
+
+    const steps: NewStep[] = workflow.dag.steps.map((step) => ({
+      name: step.name,
+      dependsOn: step.dependsOn,
+      maxAttempts: step.maxAttempts,
+      timeoutMs: step.timeoutMs,
+      priority: step.priority,
+      concurrencyKey: step.concurrency?.key,
+      concurrencyLimit: step.concurrency?.limit,
+      rateKey: step.rateLimit?.key,
+      rateLimit: step.rateLimit?.limit,
+      rateWindowMs: step.rateLimit?.windowMs,
+      status: step.dependsOn.length === 0 ? 'ready' : 'pending',
+    }))
+
+    await insertSteps(tx, run.id, steps)
+    await insertHistory(tx, { runId: run.id, type: 'run.created', data: { input: input.input } })
+
+    return { runId: run.id, workflowId: workflow.id, created: true }
+  })
 }

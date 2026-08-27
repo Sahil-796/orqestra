@@ -194,6 +194,155 @@ is expressed as a future `run_after`, so a waiting retry occupies no worker.
 
 ---
 
+## Orchestration
+
+### Dependencies, fan-out and fan-in
+
+```ts
+const shards = builder.fanOut('shard', 10, async (i) => process(i), { dependsOn: ['seed'] })
+builder.step('combine', combineFn, { dependsOn: shards })
+```
+
+A step becomes claimable exactly when every step it names in `dependsOn` has resolved. Fan-out
+and fan-in need no special primitive: N steps naming the same dependency all become ready
+together and N workers claim them in parallel, and a join step naming all N runs once, after
+the last of them commits. The release is a single row update per completion, so ten workers
+finishing ten siblings at the same instant release the join exactly once.
+
+### Conditional branching
+
+```ts
+builder.step('decide', async (ctx) => {
+  if (!needsReview) ctx.skip('review')
+  return 'decided'
+})
+builder.step('review',  reviewFn,  { dependsOn: ['decide'] })
+builder.step('publish', publishFn, { dependsOn: ['decide', 'review'] })
+```
+
+`ctx.skip` names sibling steps that should not run. They are recorded as `skipped` — a
+terminal state, not an error — and a skipped dependency satisfies a downstream `dependsOn`
+exactly like a completed one, so `publish` still runs. Without that rule, an untaken branch
+would strand every join behind it forever.
+
+A skip only takes effect if the deciding step itself commits: calling `ctx.skip` and then
+throwing skips nothing. A step whose dependencies *all* resolved by being skipped is skipped
+too, rather than run against no real input, so an untaken branch's whole downstream chain
+resolves in one pass.
+
+### Child workflows
+
+```ts
+const result = await runChildWorkflow(db, ctx, childWorkflow, { input })
+```
+
+A step can start another workflow and wait for its result. Waiting is durable, the same way
+sleeping is: the parent step is written to `blocked`, its lease released and its worker freed,
+and it is woken by the child's terminal transition — not by a timer, and not by the process
+that spawned it. Kill that process and the parent still resumes when the child finishes.
+
+A failed or cancelled child throws `ChildWorkflowError` in the parent, which fails the parent
+step like any other error. Use `runChildWorkflowResult` to inspect the outcome instead of
+throwing. Awaiting a child costs no retry attempt, and cancelling a parent cancels its blocked
+step — though not, for now, the child run itself.
+
+---
+
+## Signals & triggers
+
+Phase 5 gives a run ways to *wait for the outside world* and five ways to *be started by it*. The
+engine stops being only a library you call and becomes a service that reacts.
+
+### Waiting for an event
+
+```ts
+const payment = await ctx.waitForEvent('payment.confirmed')
+```
+
+`ctx.waitForEvent` suspends the step durably — exactly like sleep and child-await: the step is
+written to `blocked`, its lease released and its worker freed, and it is woken only when a matching
+event is published. The wait lives on the `step` row (`waiting_event_name` + an optional
+correlation key), so a killed process still resumes when the event arrives. Delivery is
+replay-safe and exactly-once: an `event_seq` counter and stored `event_payloads` mean a resumed
+step returns the same payload it would have the first time, and a given publish wakes each blocked
+step at most once. There is no backlog — a waiter is woken only by events published at or after its
+wait began, and the throw→block race is closed against the step's own DB claim time, so no clock
+skew can lose or double-deliver a signal.
+
+Publish an event from anywhere with `publishSignal(db, { name, correlationKey?, payload? })`.
+
+### Starting a run five ways
+
+An HTTP server (`startServer()`, or `bun run src/server.ts`) is the front door:
+
+| Way in            | How                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| **API trigger**   | `POST /runs` (or `/workflows/:name/runs`) with a JSON `input` — starts a run now      |
+| **Delayed start** | the same call with `runAt` (a timestamp) or `delayMs` — records a one-shot schedule   |
+| **Webhook**       | `POST /webhooks/:name` — durably publishes an event, resuming any `waitForEvent`      |
+| **Signal**        | `POST /signals` — a direct `publishSignal` over HTTP                                  |
+| **Cron / event**  | declared on the workflow, fired by the trigger daemon (below)                         |
+
+All the start and publish paths take an idempotency key (the `Idempotency-Key` header, or a
+webhook delivery id) so a retried request collapses to one run or one event — the same
+exactly-once guarantee the rest of the engine leans on.
+
+Cron and internal-event triggers are declared on the definition:
+
+```ts
+defineWorkflow('nightly-rollup', build, { triggers: [{ type: 'cron', cron: '0 3 * * *' }] })
+defineWorkflow('on-signup', build, { triggers: [{ type: 'event', event: 'user.created' }] })
+```
+
+The **trigger daemon** (`startTriggerRunner({ db, workflows })`) is a poll loop, not a hot loop —
+between ticks it sleeps and releases, the same discipline as the worker. Each tick it claims due
+schedules (`FOR UPDATE SKIP LOCKED`, with a guard bump so two daemons never double-fire) and starts
+their runs — advancing a cron to its next occurrence, disabling a one-shot — and routes freshly
+published events to the workflows that subscribe to them. Cron registration is idempotent across a
+process *restart*, not just within one process, so a redeploy never duplicates a schedule.
+
+---
+
+## Flow control at scale
+
+Phase 6 adds three ways to keep the queue honest under load — all enforced atomically inside
+the same claim transaction that already does `FOR UPDATE SKIP LOCKED`, with no extra
+infrastructure.
+
+```ts
+wf.step('chargeCard', chargeFn, {
+  concurrency: { key: 'payment-processor', limit: 3 },       // #12: at most 3 running at once
+})
+
+wf.step('callPartnerApi', callFn, {
+  rateLimit: { key: 'partner-api', limit: 100, windowMs: 60_000 }, // #13: at most 100 starts/min
+})
+
+wf.step('notifyCustomer', notifyFn, { priority: 10 })         // #14: claimed ahead of priority 0
+```
+
+**Concurrency limits (#12)** cap how many steps sharing a key are `running` at once, globally —
+not per-worker, not per-run. A step blocked by a full key just stays `ready` and is retried on
+the next poll.
+
+**Rate limiting (#13)** caps how many steps sharing a key may *start* per fixed window. A step
+that would exceed the window's budget is deferred — its `run_after` pushed to the next window
+boundary — rather than failed; it becomes claimable again the moment fresh budget exists.
+
+**Priorities + fairness (#14)** let higher-priority steps be claimed first, with *aging* so a
+flood of high-priority work can't starve normal-priority steps forever: the longer a step
+waits, the more its effective priority climbs, until it eventually outranks even fresh
+high-priority work.
+
+Both limits are closed against the same race: a naive `count(*) < limit` check lets two
+concurrent claimers each read a stale "under limit" count and both claim. The fix is a
+per-key `pg_advisory_xact_lock` that serializes same-key claims (and only same-key claims —
+different keys, and the un-keyed fast path, never contend) so the recount under the lock is
+always a fresh, authoritative snapshot. See [`docs/phase-6.md`](docs/phase-6.md) for the full
+design, including the fixed-window rate model and the aging formula.
+
+---
+
 ## Configuration
 
 Configuration is read from the environment by `src/config.ts`, which fails fast with a clear
@@ -207,6 +356,10 @@ error on malformed input.
 | `ORQ_LEASE_TTL_MS`       | `30000`                                              | How long a claim holds before it is reclaimable |
 | `ORQ_POLL_INTERVAL_MS`   | `200`                                                | Worker sleep after finding the queue empty      |
 | `ORQ_WORKER_CONCURRENCY` | `1`                                                  | Max steps one worker runs at once               |
+| `ORQ_HTTP_HOST`          | `0.0.0.0`                                             | Trigger server bind host                        |
+| `ORQ_HTTP_PORT`          | `3000`                                               | Trigger server bind port                        |
+| `ORQ_PRIORITY_AGE_RATE_PER_SEC` | `1`                                            | Priority points added per second a step has waited (`0` disables aging) |
+| `ORQ_PRIORITY_AGE_MAX_BOOST`    | `100`                                          | Cap on the aging boost                          |
 
 Lease TTL is the tuning knob that matters: too short and healthy long steps get reclaimed
 and double-run; too long and a crashed worker's job stalls. In-flight steps heartbeat to
@@ -219,14 +372,14 @@ extend their lease, which decouples the TTL from step duration.
 ```
 src/
   define/          public API — defineWorkflow, WorkflowContext
-  engine/          the durable brain — executor, scheduler, retry, sleep, timeout
+  engine/          the durable brain — executor, scheduler, retry, sleep, timeout, dag, child
   queue/           claim (FOR UPDATE SKIP LOCKED) and lease
   worker/          the long-running process loop
   store/           Postgres only — every query lives here
     migrations/    append-only numbered SQL
     client.ts      the connection
     repositories.ts typed query functions
-  control/         cancellation; concurrency, rate limits and priority later
+  control/         cancellation, child runs, concurrency limits, rate limiting, priority aging
   triggers/        api · cron · webhook · event
   observability/   structured logger, metrics
   types.ts         core types + Result codec
@@ -239,18 +392,22 @@ critical logic stays unit-testable without a database, and storage stays swappab
 
 ### The data model
 
-Eight tables carry the whole engine.
+The core tables carry the whole engine.
 
 | Table               | Purpose                                                  |
 | ------------------- | -------------------------------------------------------- |
 | `workflow`          | A registered definition and its version                   |
 | `run`               | One execution of a workflow                               |
-| `step`              | The queue and the durable step log, unified               |
-| `signal_wait`       | What a run is blocked on                                  |
-| `event`             | Events that have arrived                                  |
+| `step`              | The queue and the durable step log, unified — plus what a blocked step is waiting for |
+| `events`            | Published signals/events — an append-only log             |
+| `schedules`         | Cron, delayed and one-shot run starts                     |
+| `rate_window`       | Per-key, per-window start counters for rate limiting (#13) |
 | `history`           | Append-only observability spine                           |
 | `dead_letter`       | Runs that exhausted their retries                         |
 | `schema_migrations` | Which migrations have been applied                        |
+
+(The original `signal_wait` and `event` placeholder tables from migration 0001 are superseded —
+a blocked step's event-wait now lives on `step` columns, and the durable event log is `events`.)
 
 Several choices are cheap now and painful to retrofit, so they are in from the start:
 `workflow.version`, so a run started on v1 finishes on v1's logic even after v2 deploys;
@@ -268,6 +425,7 @@ Runnable against a local Postgres:
 bun run examples/durable.ts            # a DAG that fans out and back in
 bun run examples/workers.ts            # 3 workers draining one queue, with a retry
 bun run examples/sleeping-workflow.ts  # a step that sleeps and releases its worker
+bun run examples/flow-control.ts       # concurrency limits, rate limiting and priority together
 ```
 
 ---
@@ -291,3 +449,16 @@ mid-step and asserts that leases are reclaimed and completed steps are never re-
 ## Status
 
 orqestra is under active development and the public API is not stable.
+
+Built depth-first over nine phases (0–8), 35 features; the authoritative plan is
+[`docs/build-plan.html`](docs/build-plan.html), with per-phase notes in `docs/phase-N.md`.
+
+**Phases 0–6 are done:** the Postgres foundation, durable execution with crash recovery, the
+claim queue with expiring leases and concurrent workers, execution control (sleep, timeouts,
+cancellation), orchestration (dependencies, fan-out/fan-in, conditional branching, child
+workflows), signals & triggers (`ctx.waitForEvent`, plus API, event, cron, delayed and
+webhook starts), and flow control at scale (concurrency limits, rate limiting, priorities with
+anti-starvation aging).
+
+**Next is Phase 7 — failure handling:** dead-letter queues and compensation. Phase 8 covers
+observability.

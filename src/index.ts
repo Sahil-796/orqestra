@@ -7,7 +7,7 @@ import { migrate } from './store/migrate.ts'
 import * as repositories from './store/repositories.ts'
 import { cancelRun, type CancelResult } from './control/cancel.ts'
 
-export { defineWorkflow, getRegisteredWorkflow } from './define/workflow.ts'
+export { defineWorkflow, getRegisteredWorkflow, getWorkflowTriggers } from './define/workflow.ts'
 export type { WorkflowBuilder, WorkflowHandle, StepFn, StepOptions } from './define/workflow.ts'
 export type { WorkflowContext } from './define/context.ts'
 export { createWorkflowContext } from './define/context.ts'
@@ -18,11 +18,77 @@ export type { StartRunOptions, RunResult, EnqueueRunResult, AdvanceResult } from
 export { SleepSignal, isSleepSignal, parseDuration } from './engine/sleep.ts'
 export { StepTimeoutError, isStepTimeoutError, withTimeout } from './engine/timeout.ts'
 
+// Phase 4 #20: child workflows. The wait is event-driven — the parent step
+// suspends once into the `blocked` status and is woken by the child run's
+// terminal transition. See src/control/child.ts's module doc for the full
+// path and the propagation policy.
+export {
+  ChildWorkflowError,
+  isChildWorkflowError,
+  ChildBlockSignal,
+  isChildBlockSignal,
+  classifyChildRun,
+  isTerminalRunStatus,
+  type ChildOutcome,
+} from './engine/child.ts'
+export {
+  spawnChildRun,
+  getChildOutcome,
+  awaitChildRun,
+  runChildWorkflow,
+  runChildWorkflowResult,
+  type SpawnChildOptions,
+  type SpawnChildResult,
+  type AwaitChildOptions,
+  type ChildRunResult,
+} from './control/child.ts'
+export { nextChildCallSeq } from './define/context.ts'
+export { advanceDag, maybeFinalizeRun, wakeParentAwaiting, sweepBlockedChildAwaits } from './engine/dag.ts'
+
 export { createWorker } from './worker/worker.ts'
 export type { Worker, WorkerOptions } from './worker/worker.ts'
 
 export { cancelRun, isRunCancelled, sweepCancelledRuns } from './control/cancel.ts'
 export type { CancelResult } from './control/cancel.ts'
+
+// Phase 5 — Signals & triggers. Runs pause on ctx.waitForEvent and resume when
+// an event is published; they also start five ways — direct API call, internal
+// event, cron, a future timestamp, or an inbound webhook.
+export { publishSignal } from './control/signal.ts'
+export type { PublishSignalInput, PublishSignalResult } from './control/signal.ts'
+export { startRun as startRunByName, scheduleRun } from './control/start.ts'
+export type { StartRunInput, ScheduleRunInput } from './control/start.ts'
+
+export { startServer } from './server.ts'
+export type { StartServerOptions } from './server.ts'
+export { createTriggerHandler } from './triggers/http.ts'
+export { mapWebhookToEvent } from './triggers/webhook.ts'
+
+export { startTriggerRunner, runTriggerTick } from './triggers/runner.ts'
+export type { TriggerRunner, TriggerRunnerOptions, TriggerTickResult } from './triggers/runner.ts'
+export { pollDueSchedules } from './triggers/scheduled.ts'
+export { pollUndispatchedEvents, eventTriggerIdempotencyKey } from './triggers/events.ts'
+export {
+  computeNextRun,
+  validateCronExpression,
+  parseCronExpression,
+  syncCronSchedules,
+} from './triggers/cron.ts'
+
+// Phase 6 — Flow control at scale. Concurrency limits (#12): a step declares a
+// concurrency key + limit and the claim query enforces "at most N running for
+// this key" atomically under a flood of concurrent claims. Priority aging
+// (#14): the claim orders by an effective priority that grows with wait time,
+// so normal-priority work is not starved by high-priority floods.
+export { validateConcurrency, isConcurrencyLimited } from './control/concurrency.ts'
+export { effectivePriority, ageBoost } from './control/priority.ts'
+export type { PriorityAgingConfig } from './control/priority.ts'
+// Rate limiting (#13): a step declares a rate key + limit + window and the claim
+// query enforces "at most N starts per window for this key" atomically under a
+// flood of concurrent claims, deferring exhausted steps to the next window.
+export { validateRateLimit, isRateLimited, windowStartMs, nextWindowStartMs } from './control/ratelimit.ts'
+// `ConcurrencyLimit` and `RateLimit` (the step-declaration types) are already
+// re-exported via `export * from './types.ts'` below.
 
 export type { OrqConfig, LogLevel } from './config.ts'
 export { loadConfig } from './config.ts'
