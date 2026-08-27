@@ -1,6 +1,27 @@
 // core types shared across the engine + a jsonb-safe Result codec
 
-export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+// Phase 7 adds two terminal values (0008_failure_handling.sql):
+//   'dead_letter' — a run that exhausted its retries (or failed unrecoverably)
+//   and has been parked for inspection / manual retry rather than discarded.
+//   'completed_with_errors' — a run that finished under the `continue_on_error`
+//   failure policy with at least one failed step (partial success).
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'dead_letter'
+  | 'completed_with_errors'
+
+// How a run reacts to a step exhausting its retries (#25), mirrored by the
+// `run.failure_policy` CHECK (0008_failure_handling.sql):
+//   'fail_fast'         — stop the run at the first exhausted step (default).
+//   'continue_on_error' — keep running independent steps, ending in
+//                         `completed_with_errors` if any step failed.
+export type FailurePolicy = 'fail_fast' | 'continue_on_error'
+
+export const FAILURE_POLICIES: readonly FailurePolicy[] = ['fail_fast', 'continue_on_error']
 
 // Phase 4 adds two values (0004_orchestration.sql):
 //   'skipped' — an untaken conditional branch (#17); terminal, not an error.
@@ -22,6 +43,8 @@ export const RUN_STATUSES: readonly RunStatus[] = [
   'completed',
   'failed',
   'cancelled',
+  'dead_letter',
+  'completed_with_errors',
 ]
 
 export const STEP_STATUSES: readonly StepStatus[] = [
