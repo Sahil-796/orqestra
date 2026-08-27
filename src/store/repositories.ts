@@ -335,7 +335,11 @@ export async function resolveBlockedStepForChildRun(
       and status = 'blocked'
       and exists (
         select 1 from run
-        where id = ${childRunId} and status in ('completed', 'failed', 'cancelled')
+        where id = ${childRunId}
+          -- Must stay in sync with TERMINAL_RUN_STATUSES in engine/child.ts.
+          -- Phase 7's dead_letter/completed_with_errors are terminal too; leaving
+          -- them out would hang a parent blocked on a child that dead-letters.
+          and status in ('completed', 'completed_with_errors', 'failed', 'cancelled', 'dead_letter')
       )
     returning *
   `
