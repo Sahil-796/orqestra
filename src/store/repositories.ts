@@ -5,7 +5,7 @@
 import type postgres from 'postgres'
 import type { Db } from './client.ts'
 import { withTransaction } from './client.ts'
-import type { RunStatus, ScheduleKind, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
+import type { FailurePolicy, RunStatus, ScheduleKind, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
 import { encodeResult, ok, type Result } from '../types.ts'
 
 function toJson(value: unknown): postgres.JSONValue {
@@ -35,6 +35,12 @@ export interface RunRow {
   cancel_requested_at: Date | null
   parent_run_id: string | null
   parent_step_id: string | null
+  // Phase 7 (0008_failure_handling.sql). Dead-letter metadata — both null until
+  // `deadLetterRun` parks the run, cleared again by `resetRunForRetry`.
+  dead_lettered_at: Date | null
+  dead_letter_reason: string | null
+  // Which failure policy this run ran under (#25). Null = the default fail-fast.
+  failure_policy: FailurePolicy | null
 }
 
 export interface StepRow {
@@ -1651,4 +1657,259 @@ export async function startRunForWorkflowName(
 
     return { runId: run.id, workflowId: workflow.id, created: true }
   })
+}
+
+// ---- failure handling: dead-letter, retry, compensation (Phase 7) ---------
+//
+// Everything here is pure storage behind the boundary. The *policy* — when a
+// run is exhausted enough to dead-letter, how a saga decides to unwind, what a
+// compensation actually does — lives in engine/ and control/ and calls through
+// these functions. This layer only records and transitions durable state.
+
+// Park an exhausted / unrecoverably-failed run in `dead_letter` with a reason
+// and timestamp. The WHERE clause is the no-op guard: only a run that is still
+// in a live-or-failed state can be dead-lettered, and only once — a run already
+// in `dead_letter` (or terminal-clean `completed`/`cancelled`) matches zero
+// rows and returns undefined, so a duplicate dead-letter request can't move the
+// timestamp or overwrite the original reason. Sets `finished_at` too: a
+// dead-lettered run is done running (until an operator revives it), so its
+// timeline should close the same way a `failed` run's does.
+export async function deadLetterRun(
+  sql: Db,
+  runId: string,
+  reason: string
+): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    update run set
+      status = 'dead_letter',
+      dead_lettered_at = now(),
+      dead_letter_reason = ${reason},
+      finished_at = coalesce(finished_at, now())
+    where id = ${runId}
+      and status in ('queued', 'running', 'failed')
+    returning *
+  `
+  return rows[0]
+}
+
+// The operator listing surface: every run currently parked in `dead_letter`,
+// most-recently-parked first (so a triage view shows fresh failures at the
+// top), backed by run_dead_letter_idx. `limit` caps the page; the default is
+// generous but bounded so a listing never drags the whole table across the
+// wire.
+export async function listDeadLetterRuns(sql: Db, limit = 100): Promise<RunRow[]> {
+  return sql<RunRow[]>`
+    select * from run
+    where status = 'dead_letter'
+    order by dead_lettered_at desc
+    limit ${limit}
+  `
+}
+
+// A single dead-lettered run by id, for an operator drilling into one before
+// deciding to retry it. Returns undefined if the run doesn't exist OR isn't
+// actually in `dead_letter` — the caller should treat "not a dead-letter run"
+// and "no such run" alike: there is nothing to retry.
+export async function getDeadLetterRun(sql: Db, runId: string): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    select * from run where id = ${runId} and status = 'dead_letter'
+  `
+  return rows[0]
+}
+
+// Revive a dead-lettered run so a worker's normal claim path picks it up again
+// (#23 manual retry). The whole point is to land the run + its steps back in
+// exactly the shape a fresh, claimable run has, without re-doing the work that
+// already succeeded:
+//
+//   1. Flip the run from `dead_letter` back to `queued` and clear the
+//      dead-letter metadata + finished_at. `queued` is the correct target
+//      because claimNextStep only considers steps whose run is in
+//      ('queued','running'), and markRunStarted flips 'queued' -> 'running' on
+//      the first claim (re-logging run.started). The WHERE guard makes this a
+//      no-op for anything not currently dead-lettered — you can only retry out
+//      of dead-letter, and a double-retry does nothing.
+//   2. Revive the steps that did NOT succeed. A `failed` step had its
+//      dependencies satisfied (that's how it got to run and fail), so it goes
+//      straight back to `ready` with a fresh attempt budget (attempt = 0),
+//      cleared error/lease, and run_after = now(). Completed steps are left
+//      untouched — re-running successful side effects is exactly what the
+//      compensation log exists to avoid, and durable success must survive a
+//      retry. `cancelled` steps (downstream work a fail-fast run stopped when
+//      it aborted) are restored to their initial state — `ready` if they have
+//      no deps, else `pending` so recordDependencySatisfied releases them as
+//      their upstreams complete on the re-run.
+//
+// All in one transaction so a worker never observes the run `queued` while its
+// steps are still terminal (which would let it start, see nothing claimable,
+// and finish the run empty).
+export async function resetRunForRetry(sql: Db, runId: string): Promise<RunRow | undefined> {
+  return withTransaction(sql, async (tx) => {
+    const runs = await tx<RunRow[]>`
+      update run set
+        status = 'queued',
+        dead_lettered_at = null,
+        dead_letter_reason = null,
+        finished_at = null,
+        started_at = null
+      where id = ${runId} and status = 'dead_letter'
+      returning *
+    `
+    const run = runs[0]
+    if (!run) return undefined
+
+    // Failed steps: deps were already satisfied, so back to `ready` with a
+    // fresh attempt budget.
+    await tx`
+      update step set
+        status = 'ready',
+        attempt = 0,
+        error = null,
+        lease_owner = null,
+        lease_expires_at = null,
+        run_after = now(),
+        updated_at = now()
+      where run_id = ${runId} and status = 'failed'
+    `
+
+    // Cancelled steps: unstarted downstream work stopped when the run aborted —
+    // restore to their pre-run state so the DAG re-runs from where it can.
+    await tx`
+      update step set
+        status = case when depends_on = '{}' then 'ready' else 'pending' end,
+        attempt = 0,
+        error = null,
+        lease_owner = null,
+        lease_expires_at = null,
+        run_after = now(),
+        updated_at = now()
+      where run_id = ${runId} and status = 'cancelled'
+    `
+
+    return run
+  })
+}
+
+// Persist the failure policy a run runs under (#25). Small setter kept separate
+// from createRun so the executor can stamp the policy it resolved from the
+// workflow definition without every createRun caller having to thread it.
+// Returns undefined if the run doesn't exist.
+export async function setRunFailurePolicy(
+  sql: Db,
+  runId: string,
+  policy: FailurePolicy
+): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    update run set failure_policy = ${policy} where id = ${runId}
+    returning *
+  `
+  return rows[0]
+}
+
+// Read a run's failure policy, defaulting a null column to 'fail_fast' so the
+// executor always gets a concrete policy to branch on rather than a null.
+// Returns undefined only when the run itself doesn't exist.
+export async function getRunFailurePolicy(
+  sql: Db,
+  runId: string
+): Promise<FailurePolicy | undefined> {
+  const rows = await sql<{ failure_policy: FailurePolicy | null }[]>`
+    select failure_policy from run where id = ${runId}
+  `
+  const row = rows[0]
+  if (!row) return undefined
+  return row.failure_policy ?? 'fail_fast'
+}
+
+// ---- saga compensation log (#26) ------------------------------------------
+
+export interface CompensationRow {
+  id: string
+  run_id: string
+  step_id: string | null
+  step_name: string
+  status: 'executed' | 'failed'
+  result: unknown
+  error: unknown
+  created_at: Date
+}
+
+export interface RecordCompensationInput {
+  runId: string
+  /** The step whose side effect this compensation undoes. */
+  stepName: string
+  /** Optional link to the specific step row, for drill-down. */
+  stepId?: string
+  /** Did the compensation itself succeed or fail? Defaults to 'executed'. */
+  status?: 'executed' | 'failed'
+  result?: unknown
+  error?: SerializedError
+}
+
+// Record that a compensation for (run, step) has run — the durable half of
+// idempotent saga rollback. `on conflict (run_id, step_name) do nothing` makes
+// this the atomic "claim it once" primitive: the FIRST caller to record a given
+// compensation inserts the row and gets `created: true` (so it should perform
+// the real side effect, e.g. issue the refund); every later caller — a replay
+// after a crash, a manual retry, a concurrent unwind — sees the row already
+// there, inserts nothing, and gets `created: false` with the existing row, so
+// the refund never fires twice. Callers that want the strict once-only
+// guarantee should insert-then-act on `created`, not act-then-record.
+export async function recordCompensation(
+  sql: Db,
+  input: RecordCompensationInput
+): Promise<{ compensation: CompensationRow; created: boolean }> {
+  const inserted = await sql<CompensationRow[]>`
+    insert into compensation (run_id, step_id, step_name, status, result, error)
+    values (
+      ${input.runId},
+      ${input.stepId ?? null},
+      ${input.stepName},
+      ${input.status ?? 'executed'},
+      ${input.result === undefined ? null : sql.json(toJson(input.result))},
+      ${input.error === undefined ? null : sql.json(toJson(input.error))}
+    )
+    on conflict (run_id, step_name) do nothing
+    returning *
+  `
+  const insertedRow = inserted[0]
+  if (insertedRow) return { compensation: insertedRow, created: true }
+
+  const existing = await sql<CompensationRow[]>`
+    select * from compensation where run_id = ${input.runId} and step_name = ${input.stepName}
+  `
+  const existingRow = existing[0]
+  if (!existingRow) {
+    throw new Error('recordCompensation: conflict but no existing row found')
+  }
+  return { compensation: existingRow, created: false }
+}
+
+// Every compensation already recorded for a run, in execution order. The saga
+// engine reads this to know which compensations must NOT run again on a replay
+// or manual retry — the idempotency check that pairs with `recordCompensation`.
+export async function getExecutedCompensations(
+  sql: Db,
+  runId: string
+): Promise<CompensationRow[]> {
+  return sql<CompensationRow[]>`
+    select * from compensation where run_id = ${runId} order by created_at, step_name
+  `
+}
+
+// Point idempotency check: has (run, step)'s compensation already run? A thin
+// convenience over `getExecutedCompensations` for the common "should I run this
+// one compensation?" question, computed in Postgres so it doesn't drag the
+// whole log across the wire.
+export async function hasCompensationRun(
+  sql: Db,
+  runId: string,
+  stepName: string
+): Promise<boolean> {
+  const rows = await sql<{ ran: boolean }[]>`
+    select exists (
+      select 1 from compensation where run_id = ${runId} and step_name = ${stepName}
+    ) as ran
+  `
+  return rows[0]?.ran ?? false
 }
