@@ -45,6 +45,7 @@ import {
   finalizeCancelledRun,
   findMatchingEventSince,
   getRun,
+  getStepsByRun,
   getWorkflowById,
   isCancellationRequested,
   lockRun,
@@ -55,12 +56,12 @@ import {
   retryStep,
   insertHistory,
   sleepStep,
-  updateRunStatus,
   wakeStepsWaitingForEvent,
   type RunRow,
   type StepRow,
 } from '../store/repositories.ts'
-import { serializeError } from '../types.ts'
+import { serializeError, type FailurePolicy } from '../types.ts'
+import { deadLetterRunAndWake, errorMessage, finalizeWithErrors } from '../engine/executor.ts'
 import { createWorkflowContext, getSkipRequests, type WorkflowContext } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { DEFAULT_RETRY_POLICY, nextRunAfter, shouldRetry, type RetryPolicy } from '../engine/retry.ts'
@@ -202,7 +203,12 @@ export function createWorker(options: WorkerOptions): Worker {
   // is written and the outcome is discarded; that's correct, not a bug: the
   // step is someone else's problem now, and committing our stale outcome on
   // top of theirs would corrupt the log.
-  async function commitOutcome(step: StepRow, run: RunRow, outcome: StepOutcome): Promise<void> {
+  async function commitOutcome(
+    step: StepRow,
+    run: RunRow,
+    outcome: StepOutcome,
+    failurePolicy: FailurePolicy
+  ): Promise<void> {
     await withTransaction(db, async (tx) => {
       const owned = await lockStepIfOwner(tx, step.id, workerId)
       if (!owned) {
@@ -241,7 +247,7 @@ export function createWorker(options: WorkerOptions): Worker {
         // doc for why this replaces the old advanceRun(tx, run.id) rescan
         // call here specifically (not in executor.ts's inline path, which
         // keeps using advanceRun).
-        const { skippedSteps } = await advanceDag(tx, run.id, {
+        const { skippedSteps, run: finalized } = await advanceDag(tx, run.id, {
           completedName: step.name,
           skipNames: outcome.skipNames,
         })
@@ -252,6 +258,16 @@ export function createWorker(options: WorkerOptions): Worker {
             type: 'step.skipped',
             data: { reason: skipped.skip_reason },
           })
+        }
+        // #28 continue_on_error: advanceDag only finalizes a run whose every
+        // step is completed/skipped. When an EARLIER step of this run failed,
+        // that never happens — so this successful commit may instead have been
+        // the one that drained the last runnable work, leaving only
+        // failed + completed/skipped steps. Finish it as
+        // completed_with_errors. (fail_fast never reaches a drained-with-errors
+        // state — a terminal failure dead-letters and cancels the rest inline.)
+        if (!finalized && failurePolicy === 'continue_on_error') {
+          await finalizeIfDrainedWithErrors(tx, run.id)
         }
         return
       }
@@ -284,24 +300,84 @@ export function createWorker(options: WorkerOptions): Worker {
         return
       }
 
-      // Retries exhausted (or unretryable): the step and its run are done.
-      // cancelPendingSteps stops other workers from picking up the rest of
-      // a run that's already dead.
+      // Retries exhausted (or unretryable): a terminal step failure. What
+      // happens to the RUN is policy-dependent (Phase 7 #28) — the same
+      // decision the inline path (executor.ts's executeRun) makes, brought to
+      // the durable worker path here. The step row itself is `failed` either
+      // way; only the run-level transition differs by policy.
       await failStep(tx, step.id, error)
       await insertHistory(tx, { runId: run.id, stepId: step.id, type: 'step.failed', data: { error } })
       await releaseLease(tx, step.id)
-      await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
+
+      if (failurePolicy === 'continue_on_error') {
+        // #28: do NOT fail or cancel the whole run on one terminal step
+        // failure. Steps that don't depend on this one keep progressing via
+        // their own commits' advanceDag. This failure may itself have drained
+        // the last runnable work (a failed step never satisfies a dependent,
+        // so its dependents stay `pending` forever) — if so, finish the run as
+        // completed_with_errors (no rollback, no DLQ). Otherwise leave the run
+        // `running`; a later sibling's commit finalizes it.
+        await finalizeIfDrainedWithErrors(tx, run.id)
+        return
+      }
+
+      // fail_fast (#26): route the run to the dead-letter queue (status
+      // `dead_letter`) instead of a bare `failed`. deadLetterRunAndWake also
+      // wakes any parent step blocked on this run as a child (#20) — the wake
+      // path already treats `dead_letter` as terminal — so a dead-lettered
+      // child releases its parent exactly as a `failed` one did. Inside this
+      // transaction on purpose (see dag.ts's wakeParentAwaiting).
+      //
+      // #29 (saga compensation) is deliberately NOT run here. Compensations are
+      // in-memory closures registered by `ctx.compensate(...)` during a step's
+      // execution; the worker drives ONE step in isolation and never replays
+      // the workflow definition, so an earlier COMPLETED step's compensation
+      // closure is not present in this process when a later step fails. Wiring
+      // it would need a durable descriptor for `ctx.compensate` (genuine
+      // distributed-saga work), out of scope for this change — see the report.
+      const reason = `step "${step.name}" failed after ${step.max_attempts} attempt(s): ${errorMessage(error)}`
+      await deadLetterRunAndWake(tx, run.id, reason)
+      // cancelPendingSteps stops other workers from picking up the rest of a
+      // run that's already dead — worker-path-specific (the inline driver has
+      // no concurrent claimers), so it lives here rather than in the shared
+      // deadLetterRunAndWake helper.
       await cancelPendingSteps(tx, run.id)
-      await insertHistory(tx, { runId: run.id, type: 'run.failed', data: { reason: 'step.failed', stepId: step.id } })
-      // Phase 4 #20: this run may be someone's child, and a `failed` child
-      // has to release its awaiting parent step exactly as a completed one
-      // does — the parent then replays, reads the failure via
-      // getChildOutcome, and applies its own propagation policy. Inside
-      // this transaction on purpose (see dag.ts's wakeParentAwaiting).
-      // Note cancelPendingSteps above cannot do this job: it only touches
-      // `pending`/`ready`, and the awaiting step is in a different run.
-      await wakeParentAwaiting(tx, run.id)
     })
+  }
+
+  // #28 continue_on_error, worker-path finalizer. A run under this policy never
+  // dies on a single terminal step failure; it finishes as
+  // completed_with_errors once no runnable work remains and at least one step
+  // failed. "No runnable work" = no step is `ready`/`running`/`blocked` and no
+  // `pending` step is satisfiable (all its deps completed/skipped) — the latter
+  // guard is defensive: advanceDag flips satisfiable pendings to `ready` as
+  // their deps resolve, so any lingering pending is behind a failed dep, but
+  // checking keeps us from ever finalizing a run that still has a step to
+  // release. Reuses the inline driver's finalizeWithErrors (which builds the
+  // same output and wakes any awaiting parent) so both paths agree on what a
+  // completed_with_errors run looks like. Call inside the committing tx.
+  async function finalizeIfDrainedWithErrors(tx: Db, runId: string): Promise<void> {
+    const steps = await getStepsByRun(tx, runId)
+
+    const active = steps.some(
+      (s) => s.status === 'ready' || s.status === 'running' || s.status === 'blocked'
+    )
+    if (active) return
+
+    const statusByName = new Map(steps.map((s) => [s.name, s.status]))
+    const satisfiablePending = steps.some(
+      (s) =>
+        s.status === 'pending' &&
+        s.depends_on.every((d) => {
+          const st = statusByName.get(d)
+          return st === 'completed' || st === 'skipped'
+        })
+    )
+    if (satisfiablePending) return
+
+    if (!steps.some((s) => s.status === 'failed')) return
+
+    await finalizeWithErrors(tx, runId, steps)
   }
 
   // Sleep (#9). Same fencing discipline as commitOutcome — a sleep is a write
@@ -656,7 +732,7 @@ export function createWorker(options: WorkerOptions): Worker {
       const error = serializeError(
         new Error(`worker: no step function registered for step "${step.name}" in workflow "${handle.name}"`)
       )
-      await commitOutcome(step, run, { kind: 'failure', error, forcePermanent: true })
+      await commitOutcome(step, run, { kind: 'failure', error, forcePermanent: true }, handle.failurePolicy)
       return
     }
 
@@ -792,7 +868,7 @@ export function createWorker(options: WorkerOptions): Worker {
           kind: 'success',
           value: attempt.value,
           skipNames: attempt.skipNames,
-        })
+        }, handle.failurePolicy)
         return
       case 'sleep':
         await commitSleep(step, run, attempt.signal)
@@ -807,10 +883,10 @@ export function createWorker(options: WorkerOptions): Worker {
         await commitCancellation(step, run, 'in-flight')
         return
       case 'timeout':
-        await commitOutcome(step, run, { kind: 'failure', error: attempt.error, timedOut: true })
+        await commitOutcome(step, run, { kind: 'failure', error: attempt.error, timedOut: true }, handle.failurePolicy)
         return
       case 'failure':
-        await commitOutcome(step, run, { kind: 'failure', error: attempt.error })
+        await commitOutcome(step, run, { kind: 'failure', error: attempt.error }, handle.failurePolicy)
         return
     }
   }

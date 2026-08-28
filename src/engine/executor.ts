@@ -297,7 +297,7 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
 }
 
 /** Extract a human-readable message from a serialized error for a DLQ reason. */
-function errorMessage(error: SerializedError): string {
+export function errorMessage(error: SerializedError): string {
   if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
     return error.message
   }
@@ -311,10 +311,34 @@ function errorMessage(error: SerializedError): string {
  * must release whoever awaits it just as surely as one that succeeds.
  */
 async function deadLetterAndReturn(db: Db, runId: string, reason: string): Promise<RunResult> {
-  const dead = await deadLetterRun(db, runId, reason)
-  await insertHistory(db, { runId, type: 'run.dead_lettered', data: { reason } })
-  await wakeParentAwaiting(db, runId)
+  const dead = await deadLetterRunAndWake(db, runId, reason)
   return { runId, status: dead?.status ?? 'dead_letter' }
+}
+
+/**
+ * #26: the shared dead-letter write — flip the run to `dead_letter`, log it,
+ * and wake any parent step blocked on this run as a child (#20). Shared by the
+ * inline driver (via `deadLetterAndReturn`) and the durable worker path
+ * (worker.ts's `commitOutcome`), so the two agree on exactly what "route the
+ * run to the DLQ" means. `sql` may be a bare `db` (inline) or an open
+ * transaction (the worker, committing the failing step's outcome and the
+ * dead-letter transition atomically). Returns the updated run row, if any.
+ *
+ * Note it does NOT cancel the run's still-pending steps — the inline driver
+ * has no concurrent claimers so it doesn't need to, and the worker calls
+ * `cancelPendingSteps` itself right after (its siblings can be claimed by
+ * other workers, so stopping them is worker-path-specific and left to the
+ * caller).
+ */
+export async function deadLetterRunAndWake(
+  sql: Db,
+  runId: string,
+  reason: string
+): Promise<RunRow | undefined> {
+  const dead = await deadLetterRun(sql, runId, reason)
+  await insertHistory(sql, { runId, type: 'run.dead_lettered', data: { reason } })
+  await wakeParentAwaiting(sql, runId)
+  return dead
 }
 
 /**
@@ -323,7 +347,7 @@ async function deadLetterAndReturn(db: Db, runId: string, reason: string): Promi
  * path (advanceRun), except failed steps — which have no decodable result —
  * contribute `undefined`, same as a skipped step.
  */
-async function finalizeWithErrors(db: Db, runId: string, steps: StepRow[]): Promise<RunResult> {
+export async function finalizeWithErrors(db: Db, runId: string, steps: StepRow[]): Promise<RunResult> {
   const output: Record<string, unknown> = {}
   for (const step of steps) {
     if (step.status === 'completed') {
