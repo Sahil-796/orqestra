@@ -173,14 +173,18 @@ describe('schedules', () => {
     })
     expect(created.enabled).toBe(true)
 
-    const claimed = await claimDueSchedules(sql, new Date(), 100, 60_000)
+    // High limit on purpose: the whole suite shares one Postgres, so other
+    // schedule tests' due rows accumulate here. A small limit could fill the
+    // claim batch with their rows and crowd this one out — a false negative,
+    // not a real claim failure. Claim wide so this row is always in the batch.
+    const claimed = await claimDueSchedules(sql, new Date(), 100_000, 60_000)
     const mine = claimed.find((s) => s.id === created.id)
     expect(mine).toBeDefined()
     // The claim bumped next_run_at forward so a second poller won't re-claim.
     expect(mine!.next_run_at.getTime()).toBeGreaterThan(Date.now())
 
     // A second immediate claim no longer sees it.
-    const again = await claimDueSchedules(sql, new Date(), 100, 60_000)
+    const again = await claimDueSchedules(sql, new Date(), 100_000, 60_000)
     expect(again.find((s) => s.id === created.id)).toBeUndefined()
   })
 
