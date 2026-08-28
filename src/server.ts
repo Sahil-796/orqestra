@@ -12,6 +12,8 @@ import type { Db } from './store/client.ts'
 import { createTriggerHandler } from './triggers/http.ts'
 import { listDeadLetteredRuns, retryDeadLetterRun } from './control/retry.ts'
 import type { RunRow } from './store/repositories.ts'
+import { createDashboardApiHandler } from './dashboard/read-api.ts'
+import { createDashboardStaticHandler } from './dashboard/static.ts'
 
 export interface StartServerOptions {
   port?: number
@@ -99,6 +101,8 @@ async function handleRetryDeadLetter(db: Db, runId: string): Promise<Response> {
 export function createServerHandler(deps: { db: Db }): (req: Request) => Promise<Response> {
   const { db } = deps
   const triggerHandler = createTriggerHandler({ db })
+  const dashboardApiHandler = createDashboardApiHandler({ db })
+  const dashboardStaticHandler = createDashboardStaticHandler()
 
   return async function handleRequest(req: Request): Promise<Response> {
     const url = new URL(req.url)
@@ -116,6 +120,16 @@ export function createServerHandler(deps: { db: Db }): (req: Request) => Promise
       if (runId === undefined || runId.length === 0) return badRequest('run id is required')
       return handleRetryDeadLetter(db, runId)
     }
+
+    // Phase 8 dashboard: the read API (#30-#35) + operator retry/cancel
+    // (#27, #11) under /dashboard/api, then the static UI under /dashboard
+    // and /dashboard/ui/*. Both return undefined for paths they don't own so
+    // everything else still falls through to the trigger handler.
+    const dashboardApiResponse = await dashboardApiHandler(req)
+    if (dashboardApiResponse) return dashboardApiResponse
+
+    const dashboardStaticResponse = await dashboardStaticHandler(req)
+    if (dashboardStaticResponse) return dashboardStaticResponse
 
     return triggerHandler(req)
   }
