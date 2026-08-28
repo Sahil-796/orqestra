@@ -41,7 +41,7 @@ describe('executor', () => {
     }
   })
 
-  test('fails the run fast when a step throws, without running downstream steps', async () => {
+  test('dead-letters the run fast when a step throws, without running downstream steps', async () => {
     let downstreamRan = false
 
     const wf = defineWorkflow(`executor-fail-fast-test-${crypto.randomUUID()}`, (builder) => {
@@ -60,7 +60,10 @@ describe('executor', () => {
 
     const result = await startRun(sql, wf)
 
-    expect(result.status).toBe('failed')
+    // Phase 7 #26: a fail_fast run that exhausts its retry budget now lands in
+    // the dead-letter queue instead of a bare `failed`. The step row itself
+    // stays `failed`; the run is parked as `dead_letter` for manual retry.
+    expect(result.status).toBe('dead_letter')
     expect(downstreamRan).toBe(false)
 
     const steps = await getStepsByRun(sql, result.runId)

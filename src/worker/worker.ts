@@ -45,6 +45,7 @@ import {
   finalizeCancelledRun,
   findMatchingEventSince,
   getRun,
+  getStepsByRun,
   getWorkflowById,
   isCancellationRequested,
   lockRun,
@@ -55,12 +56,13 @@ import {
   retryStep,
   insertHistory,
   sleepStep,
-  updateRunStatus,
+  upsertWorkerHeartbeat,
   wakeStepsWaitingForEvent,
   type RunRow,
   type StepRow,
 } from '../store/repositories.ts'
-import { serializeError } from '../types.ts'
+import { serializeError, type FailurePolicy } from '../types.ts'
+import { deadLetterRunAndWake, errorMessage, finalizeWithErrors } from '../engine/executor.ts'
 import { createWorkflowContext, getSkipRequests, type WorkflowContext } from '../define/context.ts'
 import type { WorkflowHandle } from '../define/workflow.ts'
 import { DEFAULT_RETRY_POLICY, nextRunAfter, shouldRetry, type RetryPolicy } from '../engine/retry.ts'
@@ -68,7 +70,7 @@ import { isChildBlockSignal, isTerminalRunStatus, type ChildBlockSignal } from '
 import { isEventWaitSignal, type EventWaitSignal } from '../engine/event.ts'
 import { isSleepSignal, type SleepSignal } from '../engine/sleep.ts'
 import { isStepTimeoutError, withTimeout } from '../engine/timeout.ts'
-import { createLogger, type Logger } from '../observability/logger.ts'
+import { createLogger, createRunLogger, type Logger } from '../observability/logger.ts'
 
 export interface WorkerOptions {
   db: Db
@@ -134,6 +136,13 @@ type StepOutcome =
   // `timedOut` only changes the history label — a timeout is an ordinary
   // failure as far as the retry/backoff decision is concerned (Phase 3 #10).
   | { kind: 'failure'; error: unknown; forcePermanent?: boolean; timedOut?: boolean }
+
+// #32/#31 support: what commitOutcome actually did with a step, so the caller
+// can emit a structured metrics/log line without commitOutcome itself having
+// to know about logging (it stays focused on the fenced write). 'discarded'
+// covers the lease-fencing-lost case — nothing was written, so nothing should
+// be logged either.
+type CommitResult = 'discarded' | 'success' | 'retried' | 'failed'
 
 // What one execution of a step function turned into, before any of it is
 // persisted. Phase 2 only had success/failure; Phase 3 adds two outcomes that
@@ -202,15 +211,20 @@ export function createWorker(options: WorkerOptions): Worker {
   // is written and the outcome is discarded; that's correct, not a bug: the
   // step is someone else's problem now, and committing our stale outcome on
   // top of theirs would corrupt the log.
-  async function commitOutcome(step: StepRow, run: RunRow, outcome: StepOutcome): Promise<void> {
-    await withTransaction(db, async (tx) => {
+  async function commitOutcome(
+    step: StepRow,
+    run: RunRow,
+    outcome: StepOutcome,
+    failurePolicy: FailurePolicy
+  ): Promise<CommitResult> {
+    return withTransaction(db, async (tx): Promise<CommitResult> => {
       const owned = await lockStepIfOwner(tx, step.id, workerId)
       if (!owned) {
         log.warn('lease fencing failed at commit time — discarding outcome, another worker owns this step now', {
           stepId: step.id,
           runId: run.id,
         })
-        return
+        return 'discarded'
       }
 
       // Lock the run row FIRST, before any statement that references
@@ -241,7 +255,7 @@ export function createWorker(options: WorkerOptions): Worker {
         // doc for why this replaces the old advanceRun(tx, run.id) rescan
         // call here specifically (not in executor.ts's inline path, which
         // keeps using advanceRun).
-        const { skippedSteps } = await advanceDag(tx, run.id, {
+        const { skippedSteps, run: finalized } = await advanceDag(tx, run.id, {
           completedName: step.name,
           skipNames: outcome.skipNames,
         })
@@ -253,7 +267,17 @@ export function createWorker(options: WorkerOptions): Worker {
             data: { reason: skipped.skip_reason },
           })
         }
-        return
+        // #28 continue_on_error: advanceDag only finalizes a run whose every
+        // step is completed/skipped. When an EARLIER step of this run failed,
+        // that never happens — so this successful commit may instead have been
+        // the one that drained the last runnable work, leaving only
+        // failed + completed/skipped steps. Finish it as
+        // completed_with_errors. (fail_fast never reaches a drained-with-errors
+        // state — a terminal failure dead-letters and cancels the rest inline.)
+        if (!finalized && failurePolicy === 'continue_on_error') {
+          await finalizeIfDrainedWithErrors(tx, run.id)
+        }
+        return 'success'
       }
 
       const error = serializeError(outcome.error)
@@ -281,27 +305,120 @@ export function createWorker(options: WorkerOptions): Worker {
           type: 'step.retry_scheduled',
           data: { attempt: owned.attempt, nextRunAfter: runAfter, error },
         })
-        return
+        return 'retried'
       }
 
-      // Retries exhausted (or unretryable): the step and its run are done.
-      // cancelPendingSteps stops other workers from picking up the rest of
-      // a run that's already dead.
+      // Retries exhausted (or unretryable): a terminal step failure. What
+      // happens to the RUN is policy-dependent (Phase 7 #28) — the same
+      // decision the inline path (executor.ts's executeRun) makes, brought to
+      // the durable worker path here. The step row itself is `failed` either
+      // way; only the run-level transition differs by policy.
       await failStep(tx, step.id, error)
       await insertHistory(tx, { runId: run.id, stepId: step.id, type: 'step.failed', data: { error } })
       await releaseLease(tx, step.id)
-      await updateRunStatus(tx, run.id, 'failed', { finishedAt: new Date() })
+
+      if (failurePolicy === 'continue_on_error') {
+        // #28: do NOT fail or cancel the whole run on one terminal step
+        // failure. Steps that don't depend on this one keep progressing via
+        // their own commits' advanceDag. This failure may itself have drained
+        // the last runnable work (a failed step never satisfies a dependent,
+        // so its dependents stay `pending` forever) — if so, finish the run as
+        // completed_with_errors (no rollback, no DLQ). Otherwise leave the run
+        // `running`; a later sibling's commit finalizes it.
+        await finalizeIfDrainedWithErrors(tx, run.id)
+        return 'failed'
+      }
+
+      // fail_fast (#26): route the run to the dead-letter queue (status
+      // `dead_letter`) instead of a bare `failed`. deadLetterRunAndWake also
+      // wakes any parent step blocked on this run as a child (#20) — the wake
+      // path already treats `dead_letter` as terminal — so a dead-lettered
+      // child releases its parent exactly as a `failed` one did. Inside this
+      // transaction on purpose (see dag.ts's wakeParentAwaiting).
+      //
+      // #29 (saga compensation) is deliberately NOT run here. Compensations are
+      // in-memory closures registered by `ctx.compensate(...)` during a step's
+      // execution; the worker drives ONE step in isolation and never replays
+      // the workflow definition, so an earlier COMPLETED step's compensation
+      // closure is not present in this process when a later step fails. Wiring
+      // it would need a durable descriptor for `ctx.compensate` (genuine
+      // distributed-saga work), out of scope for this change — see the report.
+      const reason = `step "${step.name}" failed after ${step.max_attempts} attempt(s): ${errorMessage(error)}`
+      await deadLetterRunAndWake(tx, run.id, reason)
+      // cancelPendingSteps stops other workers from picking up the rest of a
+      // run that's already dead — worker-path-specific (the inline driver has
+      // no concurrent claimers), so it lives here rather than in the shared
+      // deadLetterRunAndWake helper.
       await cancelPendingSteps(tx, run.id)
-      await insertHistory(tx, { runId: run.id, type: 'run.failed', data: { reason: 'step.failed', stepId: step.id } })
-      // Phase 4 #20: this run may be someone's child, and a `failed` child
-      // has to release its awaiting parent step exactly as a completed one
-      // does — the parent then replays, reads the failure via
-      // getChildOutcome, and applies its own propagation policy. Inside
-      // this transaction on purpose (see dag.ts's wakeParentAwaiting).
-      // Note cancelPendingSteps above cannot do this job: it only touches
-      // `pending`/`ready`, and the awaiting step is in a different run.
-      await wakeParentAwaiting(tx, run.id)
+      return 'failed'
     })
+  }
+
+  // #31/#32: emits a best-effort structured log line describing what
+  // commitOutcome just did — step id, run id, status, attempt, and wall-clock
+  // duration of the attempt. Deliberately called AFTER commitOutcome's
+  // transaction has already committed (or discarded), so a logging hiccup can
+  // never affect run correctness — it only ever describes a write that
+  // already happened. 'discarded' (lease lost) logs nothing: nothing was
+  // actually written for this attempt.
+  async function logStepCommit(
+    step: StepRow,
+    run: RunRow,
+    result: CommitResult,
+    outcome: StepOutcome,
+    attemptStartedAt: number
+  ): Promise<void> {
+    if (result === 'discarded') return
+    const durationMs = Date.now() - attemptStartedAt
+    const status = result === 'success' ? 'completed' : result === 'retried' ? 'retry_scheduled' : 'failed'
+    const runLog = createRunLogger(db, run.id, { workerId, stepId: step.id })
+    const fields = {
+      stepName: step.name,
+      attempt: step.attempt,
+      maxAttempts: step.max_attempts,
+      durationMs,
+      timedOut: outcome.kind === 'failure' ? Boolean(outcome.timedOut) : false,
+    }
+    if (result === 'failed') {
+      runLog.warn(`step ${status}`, fields)
+    } else {
+      runLog.info(`step ${status}`, fields)
+    }
+  }
+
+  // #28 continue_on_error, worker-path finalizer. A run under this policy never
+  // dies on a single terminal step failure; it finishes as
+  // completed_with_errors once no runnable work remains and at least one step
+  // failed. "No runnable work" = no step is `ready`/`running`/`blocked` and no
+  // `pending` step is satisfiable (all its deps completed/skipped) — the latter
+  // guard is defensive: advanceDag flips satisfiable pendings to `ready` as
+  // their deps resolve, so any lingering pending is behind a failed dep, but
+  // checking keeps us from ever finalizing a run that still has a step to
+  // release. Reuses the inline driver's finalizeWithErrors (which builds the
+  // same output and wakes any awaiting parent) so both paths agree on what a
+  // completed_with_errors run looks like. Call inside the committing tx.
+  async function finalizeIfDrainedWithErrors(tx: Db, runId: string): Promise<void> {
+    const steps = await getStepsByRun(tx, runId)
+
+    const active = steps.some(
+      (s) => s.status === 'ready' || s.status === 'running' || s.status === 'blocked'
+    )
+    if (active) return
+
+    const statusByName = new Map(steps.map((s) => [s.name, s.status]))
+    const satisfiablePending = steps.some(
+      (s) =>
+        s.status === 'pending' &&
+        s.depends_on.every((d) => {
+          const st = statusByName.get(d)
+          return st === 'completed' || st === 'skipped'
+        })
+    )
+    if (satisfiablePending) return
+
+    if (!steps.some((s) => s.status === 'failed')) return
+
+    await finalizeWithErrors(tx, runId, steps)
   }
 
   // Sleep (#9). Same fencing discipline as commitOutcome — a sleep is a write
@@ -656,7 +773,9 @@ export function createWorker(options: WorkerOptions): Worker {
       const error = serializeError(
         new Error(`worker: no step function registered for step "${step.name}" in workflow "${handle.name}"`)
       )
-      await commitOutcome(step, run, { kind: 'failure', error, forcePermanent: true })
+      const noFnOutcome: StepOutcome = { kind: 'failure', error, forcePermanent: true }
+      const noFnResult = await commitOutcome(step, run, noFnOutcome, handle.failurePolicy)
+      await logStepCommit(step, run, noFnResult, noFnOutcome, Date.now())
       return
     }
 
@@ -698,6 +817,11 @@ export function createWorker(options: WorkerOptions): Worker {
           log.error('heartbeat failed', { stepId: step.id, runId: run.id, error: serializeError(e) })
         })
     }, heartbeatIntervalMs)
+
+    // Marks the start of this attempt, purely for the #32 duration figure
+    // logged after the commit below — never used for any correctness
+    // decision (timeouts are enforced by withTimeout/step.timeout_ms).
+    const attemptStartedAt = Date.now()
 
     // Classify one execution of the step function. Everything here is decided
     // in memory; nothing is written until the commit* call below, so a lease
@@ -787,13 +911,12 @@ export function createWorker(options: WorkerOptions): Worker {
     if (abandoned) return
 
     switch (attempt.kind) {
-      case 'success':
-        await commitOutcome(step, run, {
-          kind: 'success',
-          value: attempt.value,
-          skipNames: attempt.skipNames,
-        })
+      case 'success': {
+        const outcome: StepOutcome = { kind: 'success', value: attempt.value, skipNames: attempt.skipNames }
+        const result = await commitOutcome(step, run, outcome, handle.failurePolicy)
+        await logStepCommit(step, run, result, outcome, attemptStartedAt)
         return
+      }
       case 'sleep':
         await commitSleep(step, run, attempt.signal)
         return
@@ -806,20 +929,56 @@ export function createWorker(options: WorkerOptions): Worker {
       case 'cancelled':
         await commitCancellation(step, run, 'in-flight')
         return
-      case 'timeout':
-        await commitOutcome(step, run, { kind: 'failure', error: attempt.error, timedOut: true })
+      case 'timeout': {
+        const outcome: StepOutcome = { kind: 'failure', error: attempt.error, timedOut: true }
+        const result = await commitOutcome(step, run, outcome, handle.failurePolicy)
+        await logStepCommit(step, run, result, outcome, attemptStartedAt)
         return
-      case 'failure':
-        await commitOutcome(step, run, { kind: 'failure', error: attempt.error })
+      }
+      case 'failure': {
+        const outcome: StepOutcome = { kind: 'failure', error: attempt.error }
+        const result = await commitOutcome(step, run, outcome, handle.failurePolicy)
+        await logStepCommit(step, run, result, outcome, attemptStartedAt)
         return
+      }
+    }
+  }
+
+  // #34 (write side): this worker's own row in worker_health. Best-effort and
+  // outside any run/step transaction on purpose — a heartbeat is an
+  // observability side-channel, never something a run's correctness can
+  // depend on. Reused for both the periodic tick (below) and the final
+  // "stopped" write in stop().
+  async function sendHeartbeat(status: 'running' | 'draining' | 'stopped'): Promise<void> {
+    try {
+      await upsertWorkerHeartbeat(db, {
+        workerId,
+        hostname: hostname(),
+        status,
+        leasedSteps: inFlight.size,
+        concurrency,
+      })
+    } catch (e) {
+      log.error('worker heartbeat failed', { error: serializeError(e) })
     }
   }
 
   async function runLoop(): Promise<void> {
     let lastReclaimAt = 0
+    // Reuses the existing per-step lease-heartbeat cadence rather than
+    // inventing a new config knob (heartbeatIntervalMs is already derived
+    // from ORQ_LEASE_TTL_MS) — this worker-level heartbeat just piggybacks on
+    // the same tick rate.
+    let lastWorkerHeartbeatAt = 0
 
     while (!stopping) {
       const now = Date.now()
+
+      if (now - lastWorkerHeartbeatAt >= heartbeatIntervalMs) {
+        lastWorkerHeartbeatAt = now
+        await sendHeartbeat('running')
+      }
+
       if (now - lastReclaimAt >= reclaimIntervalMs) {
         lastReclaimAt = now
         try {
@@ -889,11 +1048,15 @@ export function createWorker(options: WorkerOptions): Worker {
 
     async stop(): Promise<void> {
       stopping = true
+      await sendHeartbeat('draining')
       if (loopDone) await loopDone
       // Every in-flight step releases its own lease as part of committing
       // its outcome (success, retry, or permanent failure) — awaiting them
       // here is what makes stop() "graceful": nothing is abandoned mid-air.
       await Promise.allSettled(Array.from(inFlight))
+      // Final write so a dashboard reading worker_health sees this worker
+      // leave cleanly rather than merely going stale.
+      await sendHeartbeat('stopped')
     },
 
     get inFlight(): number {

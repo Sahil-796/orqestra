@@ -6,6 +6,7 @@ import { createDb, type Db } from './store/client.ts'
 import { migrate } from './store/migrate.ts'
 import * as repositories from './store/repositories.ts'
 import { cancelRun, type CancelResult } from './control/cancel.ts'
+import { retryDeadLetterRun, type RetryDeadLetterResult } from './control/retry.ts'
 
 export { defineWorkflow, getRegisteredWorkflow, getWorkflowTriggers } from './define/workflow.ts'
 export type { WorkflowBuilder, WorkflowHandle, StepFn, StepOptions } from './define/workflow.ts'
@@ -51,6 +52,16 @@ export type { Worker, WorkerOptions } from './worker/worker.ts'
 export { cancelRun, isRunCancelled, sweepCancelledRuns } from './control/cancel.ts'
 export type { CancelResult } from './control/cancel.ts'
 
+// Phase 7 — Failure handling. A run that exhausts its retry budget under the
+// default fail_fast policy is parked in the dead-letter queue (#26) instead of
+// vanishing; an operator re-drives it with retryDeadLetterRun (#27). A workflow
+// can opt into continue-on-error via defineWorkflow's `failurePolicy` (#28), and
+// steps register saga rollbacks with `ctx.compensate(fn)` which run in reverse
+// on terminal failure, exactly once (#29).
+export { retryDeadLetterRun, listDeadLetteredRuns } from './control/retry.ts'
+export type { RetryDeadLetterResult } from './control/retry.ts'
+export type { CompensationFn } from './define/context.ts'
+
 // Phase 5 — Signals & triggers. Runs pause on ctx.waitForEvent and resume when
 // an event is published; they also start five ways — direct API call, internal
 // event, cron, a future timestamp, or an inbound webhook.
@@ -59,7 +70,7 @@ export type { PublishSignalInput, PublishSignalResult } from './control/signal.t
 export { startRun as startRunByName, scheduleRun } from './control/start.ts'
 export type { StartRunInput, ScheduleRunInput } from './control/start.ts'
 
-export { startServer } from './server.ts'
+export { startServer, createServerHandler } from './server.ts'
 export type { StartServerOptions } from './server.ts'
 export { createTriggerHandler } from './triggers/http.ts'
 export { mapWebhookToEvent } from './triggers/webhook.ts'
@@ -131,6 +142,15 @@ export class Orquestra {
    */
   async cancel(runId: string): Promise<CancelResult> {
     return cancelRun(this.db, runId)
+  }
+
+  /**
+   * Re-drive a dead-lettered run (Phase 7 #27). Resets the parked run and its
+   * failed steps so a worker claims and re-runs it; a no-op result comes back
+   * if the id is not currently in the dead-letter queue.
+   */
+  async retry(runId: string): Promise<RetryDeadLetterResult> {
+    return retryDeadLetterRun(this.db, runId)
   }
 
   async close(): Promise<void> {

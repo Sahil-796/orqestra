@@ -218,8 +218,10 @@ describe('reclaimExpiredLeases', () => {
     expect(poisoned.reclaim_count).toBe(maxReclaims + 1)
     expect((poisoned.error as { message?: string } | null)?.message).toMatch(/poison-pill ceiling/)
 
+    // #26: a poison-pill run is routed to the dead-letter queue, not left in a
+    // bare `failed` — the operator can inspect and re-drive it from the DLQ.
     const finalRun = await getRun(sql, run.id)
-    expect(finalRun!.status).toBe('failed')
+    expect(finalRun!.status).toBe('dead_letter')
 
     // never claimable (pending on a step that never completed) — must be
     // cancelled once its run is failed, so nothing tries to run it later.

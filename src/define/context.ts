@@ -34,6 +34,34 @@ function neverAbortedSignal(): AbortSignal {
 const skipRequestsByContext = new WeakMap<WorkflowContext, string[]>()
 
 /**
+ * A rollback action registered from inside a step via `ctx.compensate(fn)`
+ * (#29, saga). It undoes the step's externally-visible side effect (refund a
+ * charge, delete a provisioned resource) and is invoked by the executor only
+ * when the run fails terminally under `fail_fast` — never on the happy path.
+ * The closure captures whatever it needs; it takes no arguments so a step
+ * author writes `ctx.compensate(() => refund(chargeId))`.
+ */
+export type CompensationFn = () => void | Promise<void>
+
+// Per-context accumulator for `ctx.compensate()` registrations, in call
+// order — same WeakMap-per-ctx trick as `getSkipRequests` so the public
+// `WorkflowContext` type stays free of any "read them back" method. The
+// executor reads these once a step's function returns successfully (a step
+// that never committed never rolls anything back) and stashes them against
+// the completed step, to replay in reverse on a terminal failure.
+const compensationsByContext = new WeakMap<WorkflowContext, CompensationFn[]>()
+
+/**
+ * Read back the compensation actions a just-finished step function registered
+ * via `ctx.compensate(...)`, in registration order. Returns `[]` if the step
+ * registered none (the common case) or `ctx` wasn't built by
+ * `createWorkflowContext`. Meant for executor.ts/worker.ts, not step code.
+ */
+export function getCompensations(ctx: WorkflowContext): readonly CompensationFn[] {
+  return compensationsByContext.get(ctx) ?? []
+}
+
+/**
  * Read back the step names a just-finished step function passed to
  * `ctx.skip(...)`, in call order, deduplicated. Returns `[]` if `skip` was
  * never called (the overwhelmingly common case) or `ctx` wasn't built by
@@ -146,6 +174,27 @@ export interface WorkflowContext {
    * is never left waiting forever.
    */
   skip(...stepNames: string[]): void
+
+  /**
+   * Feature #29, saga compensation: register a rollback action for THIS step.
+   * The `fn` records how to undo the step's side effect (e.g. refund a charge)
+   * and is stored, not run, here — nothing is executed and nothing is written
+   * to storage at registration time (this is plain/deterministic, same as
+   * `skip`). The executor reads the registrations back (via
+   * `getCompensations(ctx)`) only after the step's function returns
+   * successfully, so a step that throws before committing rolls nothing back.
+   *
+   * If the run later fails terminally under the `fail_fast` failure policy,
+   * the executor runs the registered compensations of every COMPLETED step in
+   * REVERSE completion order, each guarded by an idempotent compensation-log
+   * entry so a re-driven run never issues the same refund twice. Under
+   * `continue_on_error` compensations do NOT run — a partially-successful run
+   * keeps its successful side effects.
+   *
+   * Call it as many times as needed; registrations run in call order within a
+   * step (and steps unwind in reverse of each other).
+   */
+  compensate(fn: CompensationFn): void
 }
 
 /**
@@ -189,6 +238,7 @@ export function createWorkflowContext(input: {
   // interleaves sleeps and event-waits replays each on its own counter.
   let eventCalls = 0
   const skipRequests: string[] = []
+  const compensations: CompensationFn[] = []
 
   const ctx: WorkflowContext = {
     input: input.input,
@@ -220,9 +270,13 @@ export function createWorkflowContext(input: {
         if (!skipRequests.includes(name)) skipRequests.push(name)
       }
     },
+    compensate: (fn: CompensationFn): void => {
+      compensations.push(fn)
+    },
   }
 
   skipRequestsByContext.set(ctx, skipRequests)
+  compensationsByContext.set(ctx, compensations)
   if (input.stepId !== undefined) stepIdByContext.set(ctx, input.stepId)
   return ctx
 }

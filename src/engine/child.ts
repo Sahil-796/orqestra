@@ -90,7 +90,20 @@ export function isChildBlockSignal(value: unknown): value is ChildBlockSignal {
   return value instanceof ChildBlockSignal
 }
 
-const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ['completed', 'failed', 'cancelled']
+// Phase 7 added two terminal statuses a child run can reach: `dead_letter`
+// (exhausted its retries under fail_fast — the parked form of the old bare
+// `failed`) and `completed_with_errors` (finished under continue_on_error with
+// some steps failed). Both are terminal for the child-wake path — omitting them
+// would hang a parent blocked on a child that dead-letters. See classifyChildRun
+// for how each propagates, and keep the SQL guard in resolveBlockedStepForChildRun
+// in sync with this set.
+const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
+  'completed',
+  'completed_with_errors',
+  'failed',
+  'cancelled',
+  'dead_letter',
+]
 
 export function isTerminalRunStatus(status: RunStatus): boolean {
   return TERMINAL_RUN_STATUSES.includes(status)
@@ -116,7 +129,14 @@ export function classifyChildRun(
   output: unknown,
   failedStepError: SerializedError | undefined
 ): ChildOutcome {
-  if (status === 'completed') return { ok: true, value: output }
+  // `completed_with_errors` is a policy-chosen success: the child ran under
+  // continue_on_error and finished with output despite some failed steps, so the
+  // parent gets that (possibly partial) output rather than an error.
+  if (status === 'completed' || status === 'completed_with_errors') return { ok: true, value: output }
+  // A dead-lettered child is an unrecoverably-failed child. Before Phase 7 this
+  // same exhausted run terminated as `failed` and propagated to the parent as a
+  // failure; preserve that by surfacing it as `failed` here.
+  if (status === 'dead_letter') return { ok: false, status: 'failed', error: failedStepError }
   if (status === 'failed' || status === 'cancelled') {
     return { ok: false, status, error: failedStepError }
   }

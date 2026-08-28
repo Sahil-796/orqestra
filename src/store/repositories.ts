@@ -5,7 +5,18 @@
 import type postgres from 'postgres'
 import type { Db } from './client.ts'
 import { withTransaction } from './client.ts'
-import type { RunStatus, ScheduleKind, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
+import type {
+  FailurePolicy,
+  RunMetrics,
+  RunListItem,
+  RunStatus,
+  ScheduleKind,
+  SerializedError,
+  StepStatus,
+  WorkerHealthStatus,
+  WorkerHealthView,
+  WorkflowDefinition,
+} from '../types.ts'
 import { encodeResult, ok, type Result } from '../types.ts'
 
 function toJson(value: unknown): postgres.JSONValue {
@@ -35,6 +46,12 @@ export interface RunRow {
   cancel_requested_at: Date | null
   parent_run_id: string | null
   parent_step_id: string | null
+  // Phase 7 (0008_failure_handling.sql). Dead-letter metadata — both null until
+  // `deadLetterRun` parks the run, cleared again by `resetRunForRetry`.
+  dead_lettered_at: Date | null
+  dead_letter_reason: string | null
+  // Which failure policy this run ran under (#25). Null = the default fail-fast.
+  failure_policy: FailurePolicy | null
 }
 
 export interface StepRow {
@@ -329,7 +346,11 @@ export async function resolveBlockedStepForChildRun(
       and status = 'blocked'
       and exists (
         select 1 from run
-        where id = ${childRunId} and status in ('completed', 'failed', 'cancelled')
+        where id = ${childRunId}
+          -- Must stay in sync with TERMINAL_RUN_STATUSES in engine/child.ts.
+          -- Phase 7's dead_letter/completed_with_errors are terminal too; leaving
+          -- them out would hang a parent blocked on a child that dead-letters.
+          and status in ('completed', 'completed_with_errors', 'failed', 'cancelled', 'dead_letter')
       )
     returning *
   `
@@ -1651,4 +1672,637 @@ export async function startRunForWorkflowName(
 
     return { runId: run.id, workflowId: workflow.id, created: true }
   })
+}
+
+// ---- failure handling: dead-letter, retry, compensation (Phase 7) ---------
+//
+// Everything here is pure storage behind the boundary. The *policy* — when a
+// run is exhausted enough to dead-letter, how a saga decides to unwind, what a
+// compensation actually does — lives in engine/ and control/ and calls through
+// these functions. This layer only records and transitions durable state.
+
+// Park an exhausted / unrecoverably-failed run in `dead_letter` with a reason
+// and timestamp. The WHERE clause is the no-op guard: only a run that is still
+// in a live-or-failed state can be dead-lettered, and only once — a run already
+// in `dead_letter` (or terminal-clean `completed`/`cancelled`) matches zero
+// rows and returns undefined, so a duplicate dead-letter request can't move the
+// timestamp or overwrite the original reason. Sets `finished_at` too: a
+// dead-lettered run is done running (until an operator revives it), so its
+// timeline should close the same way a `failed` run's does.
+export async function deadLetterRun(
+  sql: Db,
+  runId: string,
+  reason: string
+): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    update run set
+      status = 'dead_letter',
+      dead_lettered_at = now(),
+      dead_letter_reason = ${reason},
+      finished_at = coalesce(finished_at, now())
+    where id = ${runId}
+      and status in ('queued', 'running', 'failed')
+    returning *
+  `
+  return rows[0]
+}
+
+// The operator listing surface: every run currently parked in `dead_letter`,
+// most-recently-parked first (so a triage view shows fresh failures at the
+// top), backed by run_dead_letter_idx. `limit` caps the page; the default is
+// generous but bounded so a listing never drags the whole table across the
+// wire.
+export async function listDeadLetterRuns(sql: Db, limit = 100): Promise<RunRow[]> {
+  return sql<RunRow[]>`
+    select * from run
+    where status = 'dead_letter'
+    order by dead_lettered_at desc
+    limit ${limit}
+  `
+}
+
+// A single dead-lettered run by id, for an operator drilling into one before
+// deciding to retry it. Returns undefined if the run doesn't exist OR isn't
+// actually in `dead_letter` — the caller should treat "not a dead-letter run"
+// and "no such run" alike: there is nothing to retry.
+export async function getDeadLetterRun(sql: Db, runId: string): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    select * from run where id = ${runId} and status = 'dead_letter'
+  `
+  return rows[0]
+}
+
+// Revive a dead-lettered run so a worker's normal claim path picks it up again
+// (#23 manual retry). The whole point is to land the run + its steps back in
+// exactly the shape a fresh, claimable run has, without re-doing the work that
+// already succeeded:
+//
+//   1. Flip the run from `dead_letter` back to `queued` and clear the
+//      dead-letter metadata + finished_at. `queued` is the correct target
+//      because claimNextStep only considers steps whose run is in
+//      ('queued','running'), and markRunStarted flips 'queued' -> 'running' on
+//      the first claim (re-logging run.started). The WHERE guard makes this a
+//      no-op for anything not currently dead-lettered — you can only retry out
+//      of dead-letter, and a double-retry does nothing.
+//   2. Revive the steps that did NOT succeed. A `failed` step had its
+//      dependencies satisfied (that's how it got to run and fail), so it goes
+//      straight back to `ready` with a fresh attempt budget (attempt = 0),
+//      cleared error/lease, and run_after = now(). Completed steps are left
+//      untouched — re-running successful side effects is exactly what the
+//      compensation log exists to avoid, and durable success must survive a
+//      retry. `cancelled` steps (downstream work a fail-fast run stopped when
+//      it aborted) are restored to their initial state — `ready` if they have
+//      no deps, else `pending` so recordDependencySatisfied releases them as
+//      their upstreams complete on the re-run.
+//
+// All in one transaction so a worker never observes the run `queued` while its
+// steps are still terminal (which would let it start, see nothing claimable,
+// and finish the run empty).
+export async function resetRunForRetry(sql: Db, runId: string): Promise<RunRow | undefined> {
+  return withTransaction(sql, async (tx) => {
+    const runs = await tx<RunRow[]>`
+      update run set
+        status = 'queued',
+        dead_lettered_at = null,
+        dead_letter_reason = null,
+        finished_at = null,
+        started_at = null
+      where id = ${runId} and status = 'dead_letter'
+      returning *
+    `
+    const run = runs[0]
+    if (!run) return undefined
+
+    // Failed steps: deps were already satisfied, so back to `ready` with a
+    // fresh attempt budget.
+    await tx`
+      update step set
+        status = 'ready',
+        attempt = 0,
+        error = null,
+        lease_owner = null,
+        lease_expires_at = null,
+        run_after = now(),
+        updated_at = now()
+      where run_id = ${runId} and status = 'failed'
+    `
+
+    // Cancelled steps: unstarted downstream work stopped when the run aborted —
+    // restore to their pre-run state so the DAG re-runs from where it can.
+    await tx`
+      update step set
+        status = case when depends_on = '{}' then 'ready' else 'pending' end,
+        attempt = 0,
+        error = null,
+        lease_owner = null,
+        lease_expires_at = null,
+        run_after = now(),
+        updated_at = now()
+      where run_id = ${runId} and status = 'cancelled'
+    `
+
+    return run
+  })
+}
+
+// Persist the failure policy a run runs under (#25). Small setter kept separate
+// from createRun so the executor can stamp the policy it resolved from the
+// workflow definition without every createRun caller having to thread it.
+// Returns undefined if the run doesn't exist.
+export async function setRunFailurePolicy(
+  sql: Db,
+  runId: string,
+  policy: FailurePolicy
+): Promise<RunRow | undefined> {
+  const rows = await sql<RunRow[]>`
+    update run set failure_policy = ${policy} where id = ${runId}
+    returning *
+  `
+  return rows[0]
+}
+
+// Read a run's failure policy, defaulting a null column to 'fail_fast' so the
+// executor always gets a concrete policy to branch on rather than a null.
+// Returns undefined only when the run itself doesn't exist.
+export async function getRunFailurePolicy(
+  sql: Db,
+  runId: string
+): Promise<FailurePolicy | undefined> {
+  const rows = await sql<{ failure_policy: FailurePolicy | null }[]>`
+    select failure_policy from run where id = ${runId}
+  `
+  const row = rows[0]
+  if (!row) return undefined
+  return row.failure_policy ?? 'fail_fast'
+}
+
+// ---- saga compensation log (#26) ------------------------------------------
+
+export interface CompensationRow {
+  id: string
+  run_id: string
+  step_id: string | null
+  step_name: string
+  status: 'executed' | 'failed'
+  result: unknown
+  error: unknown
+  created_at: Date
+}
+
+export interface RecordCompensationInput {
+  runId: string
+  /** The step whose side effect this compensation undoes. */
+  stepName: string
+  /** Optional link to the specific step row, for drill-down. */
+  stepId?: string
+  /** Did the compensation itself succeed or fail? Defaults to 'executed'. */
+  status?: 'executed' | 'failed'
+  result?: unknown
+  error?: SerializedError
+}
+
+// Record that a compensation for (run, step) has run — the durable half of
+// idempotent saga rollback. `on conflict (run_id, step_name) do nothing` makes
+// this the atomic "claim it once" primitive: the FIRST caller to record a given
+// compensation inserts the row and gets `created: true` (so it should perform
+// the real side effect, e.g. issue the refund); every later caller — a replay
+// after a crash, a manual retry, a concurrent unwind — sees the row already
+// there, inserts nothing, and gets `created: false` with the existing row, so
+// the refund never fires twice. Callers that want the strict once-only
+// guarantee should insert-then-act on `created`, not act-then-record.
+export async function recordCompensation(
+  sql: Db,
+  input: RecordCompensationInput
+): Promise<{ compensation: CompensationRow; created: boolean }> {
+  const inserted = await sql<CompensationRow[]>`
+    insert into compensation (run_id, step_id, step_name, status, result, error)
+    values (
+      ${input.runId},
+      ${input.stepId ?? null},
+      ${input.stepName},
+      ${input.status ?? 'executed'},
+      ${input.result === undefined ? null : sql.json(toJson(input.result))},
+      ${input.error === undefined ? null : sql.json(toJson(input.error))}
+    )
+    on conflict (run_id, step_name) do nothing
+    returning *
+  `
+  const insertedRow = inserted[0]
+  if (insertedRow) return { compensation: insertedRow, created: true }
+
+  const existing = await sql<CompensationRow[]>`
+    select * from compensation where run_id = ${input.runId} and step_name = ${input.stepName}
+  `
+  const existingRow = existing[0]
+  if (!existingRow) {
+    throw new Error('recordCompensation: conflict but no existing row found')
+  }
+  return { compensation: existingRow, created: false }
+}
+
+// Every compensation already recorded for a run, in execution order. The saga
+// engine reads this to know which compensations must NOT run again on a replay
+// or manual retry — the idempotency check that pairs with `recordCompensation`.
+export async function getExecutedCompensations(
+  sql: Db,
+  runId: string
+): Promise<CompensationRow[]> {
+  return sql<CompensationRow[]>`
+    select * from compensation where run_id = ${runId} order by created_at, step_name
+  `
+}
+
+// Point idempotency check: has (run, step)'s compensation already run? A thin
+// convenience over `getExecutedCompensations` for the common "should I run this
+// one compensation?" question, computed in Postgres so it doesn't drag the
+// whole log across the wire.
+export async function hasCompensationRun(
+  sql: Db,
+  runId: string,
+  stepName: string
+): Promise<boolean> {
+  const rows = await sql<{ ran: boolean }[]>`
+    select exists (
+      select 1 from compensation where run_id = ${runId} and step_name = ${stepName}
+    ) as ran
+  `
+  return rows[0]?.ran ?? false
+}
+
+// ---- observability read model (Phase 8) -----------------------------------
+//
+// Pure reads behind the storage boundary — this is the whole reason this
+// unit exists. The dashboard's collectors, read API, and UI all build on the
+// functions below rather than embedding SQL of their own. Nothing here
+// mutates run/step state (except `upsertWorkerHeartbeat`, which only ever
+// touches the new `worker_health` table).
+
+// ---- #30: run listing + per-run timeline -----------------------------------
+
+export interface RunListFilter {
+  status?: RunStatus
+  workflowName?: string
+  namespace?: string
+  /** Default 50. */
+  limit?: number
+  /** Default 0. */
+  offset?: number
+}
+
+// Paginated, newest-first run listing joined to the workflow name (the raw
+// `run` row only carries `workflow_id`), with a computed `durationMs` so
+// callers don't have to do date maths themselves. Backed by
+// `run_status_created_at_idx` / `run_namespace_created_at_idx`
+// (0009_observability.sql).
+export async function listRuns(sql: Db, filter: RunListFilter = {}): Promise<RunListItem[]> {
+  const limit = filter.limit ?? 50
+  const offset = filter.offset ?? 0
+  const statusFilter = filter.status ? sql`and r.status = ${filter.status}` : sql``
+  const workflowFilter = filter.workflowName ? sql`and w.name = ${filter.workflowName}` : sql``
+  const namespaceFilter = filter.namespace ? sql`and r.namespace = ${filter.namespace}` : sql``
+
+  const rows = await sql<
+    {
+      id: string
+      workflow_id: string
+      workflow_name: string
+      namespace: string
+      status: RunStatus
+      priority: number
+      created_at: Date
+      started_at: Date | null
+      finished_at: Date | null
+    }[]
+  >`
+    select
+      r.id, r.workflow_id, w.name as workflow_name, r.namespace, r.status, r.priority,
+      r.created_at, r.started_at, r.finished_at
+    from run r
+    join workflow w on w.id = r.workflow_id
+    where true
+      ${statusFilter}
+      ${workflowFilter}
+      ${namespaceFilter}
+    order by r.created_at desc
+    limit ${limit} offset ${offset}
+  `
+
+  return rows.map((row) => ({
+    id: row.id,
+    workflowId: row.workflow_id,
+    workflowName: row.workflow_name,
+    namespace: row.namespace,
+    status: row.status,
+    priority: row.priority,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    durationMs:
+      row.started_at && row.finished_at
+        ? row.finished_at.getTime() - row.started_at.getTime()
+        : null,
+  }))
+}
+
+// The per-run timeline (#30): every `history` row for a run, in the order it
+// happened. `history_run_id_idx` (0001) already covers (run_id, at).
+export async function getRunTimeline(sql: Db, runId: string): Promise<HistoryRow[]> {
+  return sql<HistoryRow[]>`
+    select * from history where run_id = ${runId} order by at, id
+  `
+}
+
+// ---- #31: structured logs (storage side) -----------------------------------
+//
+// No new table: collectors (a later unit) write structured logs as ordinary
+// `history` rows via `insertHistory(sql, { runId, type: 'log', data })` — this
+// is just the read-side filter, backed by `history_run_id_type_at_idx`
+// (0009_observability.sql).
+export async function getRunLogs(sql: Db, runId: string): Promise<HistoryRow[]> {
+  return sql<HistoryRow[]>`
+    select * from history where run_id = ${runId} and type = 'log' order by at, id
+  `
+}
+
+// ---- #32: duration metrics --------------------------------------------------
+
+export interface RunMetricsFilter {
+  workflowName?: string
+  namespace?: string
+  /** Only consider runs created within the last `sinceMs` milliseconds. */
+  sinceMs?: number
+  /** When true, return one row per workflow instead of one aggregate row. */
+  groupByWorkflow?: boolean
+}
+
+// Aggregates over runs/steps matching `filter`. Always returns an array:
+// one row (workflowName: null) when `groupByWorkflow` is unset, one row per
+// workflow name otherwise. See RunMetrics's doc comment (types.ts) for why
+// step duration is a creation-to-terminal proxy rather than pure execution
+// time, and why `avgRunQueueWaitMs` (from `run.created_at`/`started_at`) is
+// the more precise queue-wait figure.
+//
+// `percentile_cont` computes p50/p95 directly in Postgres so the whole step
+// table for a window never has to cross the wire for the caller to sort it.
+// Backed by `step_status_idx` (0009_observability.sql) for the terminal-step
+// scan.
+export async function getRunMetrics(
+  sql: Db,
+  filter: RunMetricsFilter = {}
+): Promise<RunMetrics[]> {
+  const workflowFilter = filter.workflowName ? sql`and w.name = ${filter.workflowName}` : sql``
+  const namespaceFilter = filter.namespace ? sql`and r.namespace = ${filter.namespace}` : sql``
+  const sinceFilter =
+    filter.sinceMs !== undefined
+      ? sql`and r.created_at >= now() - (${filter.sinceMs} * interval '1 millisecond')`
+      : sql``
+  const groupCol = filter.groupByWorkflow ? sql`w.name` : sql`null::text`
+
+  const statusRows = await sql<{ workflow_name: string | null; status: RunStatus; count: string }[]>`
+    select ${groupCol} as workflow_name, r.status, count(*)::text as count
+    from run r
+    join workflow w on w.id = r.workflow_id
+    where true ${workflowFilter} ${namespaceFilter} ${sinceFilter}
+    group by ${groupCol}, r.status
+  `
+
+  const queueWaitRows = await sql<{ workflow_name: string | null; avg_wait_ms: string | null }[]>`
+    select ${groupCol} as workflow_name,
+      avg(extract(epoch from (r.started_at - r.created_at)) * 1000) as avg_wait_ms
+    from run r
+    join workflow w on w.id = r.workflow_id
+    where r.started_at is not null
+      ${workflowFilter} ${namespaceFilter} ${sinceFilter}
+    group by ${groupCol}
+  `
+
+  const stepRows = await sql<
+    {
+      workflow_name: string | null
+      avg_ms: string | null
+      p50_ms: string | null
+      p95_ms: string | null
+      total_attempts: string | null
+      total_reclaims: string | null
+    }[]
+  >`
+    select ${groupCol} as workflow_name,
+      avg(extract(epoch from (s.updated_at - s.created_at)) * 1000) as avg_ms,
+      percentile_cont(0.5) within group (
+        order by extract(epoch from (s.updated_at - s.created_at)) * 1000
+      ) as p50_ms,
+      percentile_cont(0.95) within group (
+        order by extract(epoch from (s.updated_at - s.created_at)) * 1000
+      ) as p95_ms,
+      sum(s.attempt)::text as total_attempts,
+      sum(s.reclaim_count)::text as total_reclaims
+    from step s
+    join run r on r.id = s.run_id
+    join workflow w on w.id = r.workflow_id
+    where s.status in ('completed', 'failed')
+      ${workflowFilter} ${namespaceFilter} ${sinceFilter}
+    group by ${groupCol}
+  `
+
+  const byWorkflow = new Map<string | null, RunMetrics>()
+  function acc(workflowName: string | null): RunMetrics {
+    let existing = byWorkflow.get(workflowName)
+    if (!existing) {
+      existing = {
+        workflowName,
+        runCount: 0,
+        statusCounts: {},
+        avgStepDurationMs: null,
+        p50StepDurationMs: null,
+        p95StepDurationMs: null,
+        avgRunQueueWaitMs: null,
+        totalAttempts: 0,
+        totalReclaims: 0,
+      }
+      byWorkflow.set(workflowName, existing)
+    }
+    return existing
+  }
+
+  for (const row of statusRows) {
+    const entry = acc(row.workflow_name)
+    const count = Number(row.count)
+    entry.statusCounts[row.status] = count
+    entry.runCount += count
+  }
+  for (const row of queueWaitRows) {
+    acc(row.workflow_name).avgRunQueueWaitMs = row.avg_wait_ms !== null ? Number(row.avg_wait_ms) : null
+  }
+  for (const row of stepRows) {
+    const entry = acc(row.workflow_name)
+    entry.avgStepDurationMs = row.avg_ms !== null ? Number(row.avg_ms) : null
+    entry.p50StepDurationMs = row.p50_ms !== null ? Number(row.p50_ms) : null
+    entry.p95StepDurationMs = row.p95_ms !== null ? Number(row.p95_ms) : null
+    entry.totalAttempts = row.total_attempts !== null ? Number(row.total_attempts) : 0
+    entry.totalReclaims = row.total_reclaims !== null ? Number(row.total_reclaims) : 0
+  }
+
+  // Ensure the ungrouped case always returns exactly one row, even when
+  // nothing in `filter` matched anything yet (an empty dashboard should see
+  // a zeroed-out metrics row, not an empty array).
+  if (byWorkflow.size === 0 && !filter.groupByWorkflow) acc(null)
+
+  return [...byWorkflow.values()]
+}
+
+// ---- #33: error details + traces -------------------------------------------
+
+// Every failed step for a run, most-recently-failed first, with its full
+// `error` jsonb intact — the caller runs `deserializeError` on `.error` to
+// get back a real `Error` (message/stack/cause) for display. Backed by the
+// partial `step_run_id_failed_idx` (0009_observability.sql).
+export async function getRunErrors(sql: Db, runId: string): Promise<StepRow[]> {
+  return sql<StepRow[]>`
+    select * from step
+    where run_id = ${runId} and status = 'failed'
+    order by updated_at desc
+  `
+}
+
+// ---- #34: worker health -----------------------------------------------------
+
+export interface WorkerHealthRow {
+  worker_id: string
+  hostname: string | null
+  status: WorkerHealthStatus
+  leased_steps: number
+  concurrency: number | null
+  started_at: Date
+  last_heartbeat_at: Date
+}
+
+export interface UpsertWorkerHeartbeatInput {
+  workerId: string
+  hostname?: string
+  status?: WorkerHealthStatus
+  leasedSteps?: number
+  concurrency?: number
+}
+
+// The collector's write side: a worker calls this on every heartbeat tick.
+// `on conflict (worker_id) do update` makes this the same row for the life of
+// a worker process — `started_at` is set once, at first insert, and never
+// moved by later heartbeats (it is deliberately absent from the DO UPDATE
+// SET list).
+export async function upsertWorkerHeartbeat(
+  sql: Db,
+  input: UpsertWorkerHeartbeatInput
+): Promise<WorkerHealthRow> {
+  const rows = await sql<WorkerHealthRow[]>`
+    insert into worker_health (worker_id, hostname, status, leased_steps, concurrency, last_heartbeat_at)
+    values (
+      ${input.workerId},
+      ${input.hostname ?? null},
+      ${input.status ?? 'running'},
+      ${input.leasedSteps ?? 0},
+      ${input.concurrency ?? null},
+      now()
+    )
+    on conflict (worker_id) do update set
+      hostname = excluded.hostname,
+      status = excluded.status,
+      leased_steps = excluded.leased_steps,
+      concurrency = excluded.concurrency,
+      last_heartbeat_at = now()
+    returning *
+  `
+  const row = rows[0]
+  if (!row) throw new Error('upsertWorkerHeartbeat: insert returned no row')
+  return row
+}
+
+// Every known worker, freshest heartbeat first, with a derived `alive` flag:
+// true iff `last_heartbeat_at` is within `staleAfterMs` of now. Default
+// 30s mirrors a small multiple of a typical poll interval — callers with a
+// different `ORQ_POLL_INTERVAL_MS` should pass their own threshold. Backed
+// by `worker_health_last_heartbeat_idx` (0009_observability.sql).
+export async function listWorkerHealth(
+  sql: Db,
+  staleAfterMs = 30_000
+): Promise<WorkerHealthView[]> {
+  const rows = await sql<(WorkerHealthRow & { alive: boolean })[]>`
+    select *,
+      last_heartbeat_at >= now() - (${staleAfterMs} * interval '1 millisecond') as alive
+    from worker_health
+    order by last_heartbeat_at desc
+  `
+  return rows.map((row) => ({
+    workerId: row.worker_id,
+    hostname: row.hostname,
+    status: row.status,
+    leasedSteps: row.leased_steps,
+    concurrency: row.concurrency,
+    startedAt: row.started_at,
+    lastHeartbeatAt: row.last_heartbeat_at,
+    alive: row.alive,
+  }))
+}
+
+// ---- #35: queue depth / throughput -----------------------------------------
+
+// Full-table step-status counts — `countStepsByStatus` scoped to one run,
+// this is the fleet-wide equivalent the dashboard's queue-depth widget wants.
+// Backed by `step_status_idx` (0009_observability.sql).
+export async function getQueueDepth(sql: Db): Promise<Record<StepStatus, number>> {
+  const rows = await sql<{ status: StepStatus; count: string }[]>`
+    select status, count(*)::text as count from step group by status
+  `
+  const counts = {} as Record<StepStatus, number>
+  for (const row of rows) counts[row.status] = Number(row.count)
+  return counts
+}
+
+export interface ThroughputBucket {
+  bucketStart: Date
+  completed: number
+  failed: number
+}
+
+// Completed/failed run counts over the last `sinceMs`, bucketed into
+// `bucketMs`-wide windows anchored to the epoch (so buckets line up across
+// calls). Runs, not steps: `step` has no `finished_at` column (only
+// `created_at`/`updated_at`), so throughput is measured off `run.finished_at`
+// — backed by the partial `run_finished_at_idx` (0009_observability.sql).
+// `completed_with_errors` counts as completed (the run did finish); `failed`
+// and `dead_letter` both count as failed (neither is a clean success).
+// Buckets with zero activity are omitted rather than zero-filled — callers
+// building a chart should fill gaps themselves against their own axis.
+export async function getThroughput(
+  sql: Db,
+  sinceMs: number,
+  bucketMs = 60_000
+): Promise<ThroughputBucket[]> {
+  const rows = await sql<{ bucket_start: Date; status: RunStatus; count: string }[]>`
+    select
+      to_timestamp(
+        floor(extract(epoch from finished_at) * 1000 / ${bucketMs}) * ${bucketMs} / 1000.0
+      ) as bucket_start,
+      status,
+      count(*)::text as count
+    from run
+    where finished_at is not null
+      and finished_at >= now() - (${sinceMs} * interval '1 millisecond')
+    group by bucket_start, status
+    order by bucket_start
+  `
+
+  const byBucket = new Map<number, ThroughputBucket>()
+  for (const row of rows) {
+    const key = row.bucket_start.getTime()
+    let bucket = byBucket.get(key)
+    if (!bucket) {
+      bucket = { bucketStart: row.bucket_start, completed: 0, failed: 0 }
+      byBucket.set(key, bucket)
+    }
+    const count = Number(row.count)
+    if (row.status === 'completed' || row.status === 'completed_with_errors') bucket.completed += count
+    else if (row.status === 'failed' || row.status === 'dead_letter') bucket.failed += count
+  }
+
+  return [...byBucket.values()].sort((a, b) => a.bucketStart.getTime() - b.bucketStart.getTime())
 }

@@ -44,7 +44,8 @@ afterAll(async () => {
 async function drain(runId: string, workers: Worker[], timeoutMs = 15_000): Promise<RunRow> {
   const deadline = Date.now() + timeoutMs
   let run = await getRun(sql, runId)
-  while (run && run.status !== 'completed' && run.status !== 'failed' && Date.now() < deadline) {
+  const terminal = new Set(['completed', 'completed_with_errors', 'failed', 'cancelled', 'dead_letter'])
+  while (run && !terminal.has(run.status) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 20))
     run = await getRun(sql, runId)
   }
@@ -197,7 +198,7 @@ describe('runChildWorkflow: end-to-end', () => {
 })
 
 describe('failed-child propagation policy', () => {
-  test('default: a failed child fails the parent step (and its run)', async () => {
+  test('default: a failed child fails the parent step and dead-letters its run', async () => {
     const namespace = `child-wf-fail-${crypto.randomUUID()}`
 
     const childWf = defineWorkflow(`child-wf-fail-child-${crypto.randomUUID()}`, (builder) => {
@@ -231,7 +232,11 @@ describe('failed-child propagation policy', () => {
 
     const run = await drain(runId, [worker])
 
-    expect(run.status).toBe('failed')
+    // Phase 7 #26: an exhausted fail_fast run is dead-lettered rather than left
+    // `failed`. The child dead-letters, which still wakes the parent's blocked
+    // spawn step (a dead-lettered child propagates as a failure — see
+    // classifyChildRun); the parent step then fails and its own run dead-letters.
+    expect(run.status).toBe('dead_letter')
 
     const steps = await getStepsByRun(sql, runId)
     const spawnStep = steps.find((s) => s.name === 'spawn')
@@ -240,7 +245,7 @@ describe('failed-child propagation policy', () => {
     expect(error?.message).toContain('failed')
 
     const children = await getChildRuns(sql, runId)
-    expect(children[0]?.status).toBe('failed')
+    expect(children[0]?.status).toBe('dead_letter')
   }, 20_000)
 
   test('runChildWorkflowResult never throws — the parent step can inspect the failure itself', async () => {

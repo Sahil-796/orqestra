@@ -75,7 +75,13 @@ async function history(runId: string): Promise<HistoryRow[]> {
 }
 
 function terminal(run: RunRow | undefined): boolean {
-  return run?.status === 'completed' || run?.status === 'failed' || run?.status === 'cancelled'
+  return (
+    run?.status === 'completed' ||
+    run?.status === 'completed_with_errors' ||
+    run?.status === 'failed' ||
+    run?.status === 'cancelled' ||
+    run?.status === 'dead_letter'
+  )
 }
 
 async function stopQuietly(worker: Worker): Promise<void> {
@@ -258,7 +264,7 @@ describe('#10 step timeouts', () => {
     expect(worker.inFlight).toBe(0)
   }, 40_000)
 
-  test('a step whose retries are exhausted by timeouts fails its run permanently', async () => {
+  test('a step whose retries are exhausted by timeouts dead-letters its run', async () => {
     const namespace = `phase3-timeout-fatal-${crypto.randomUUID()}`
     // maxAttempts is 1 here (the builder default), so the very first timeout
     // is terminal — the "no retries left" branch of the same path.
@@ -302,7 +308,9 @@ describe('#10 step timeouts', () => {
     )
     await stopQuietly(worker)
 
-    expect(run!.status).toBe('failed')
+    // Phase 7 #26: an exhausted fail_fast run is routed to the dead-letter
+    // queue rather than left in a bare `failed`.
+    expect(run!.status).toBe('dead_letter')
     expect(starts.n).toBe(1)
 
     const steps = await getStepsByRun(sql, runId)
@@ -313,7 +321,8 @@ describe('#10 step timeouts', () => {
     const types = (await history(runId)).map((e) => e.type)
     expect(types).toContain('step.timed_out')
     expect(types).toContain('step.failed')
-    expect(types).toContain('run.failed')
+    // #26: the run-level terminal event is now the dead-letter transition.
+    expect(types).toContain('run.dead_lettered')
     expect(types).not.toContain('step.retry_scheduled')
   }, 40_000)
 })
