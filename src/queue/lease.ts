@@ -16,7 +16,7 @@ import {
   reclaimStep,
   releaseStep,
   resolveBlockedStepForChildRun,
-  updateRunStatus,
+  deadLetterRun,
 } from '../store/repositories.ts'
 import { serializeError } from '../types.ts'
 
@@ -93,10 +93,20 @@ export async function reclaimExpiredLeases(
           type: 'step.poisoned',
           data: { error, reclaimCount: poisoned.reclaim_count },
         })
-        await updateRunStatus(tx, poisoned.run_id, 'failed', { finishedAt: new Date() })
+        // #26: a poison-pill run has burned through its reclaim budget (a step
+        // whose lease kept expiring without ever completing — the crash-loop
+        // case). Route it to the dead-letter queue rather than a bare `failed`,
+        // so it's visible to the operator DLQ + manual retry, consistent with
+        // the worker's own retry-exhaustion path. `deadLettered` (the result
+        // array) has always named this outcome — now it truly dead-letters.
+        await deadLetterRun(
+          tx,
+          poisoned.run_id,
+          `step "${poisoned.name}" exceeded the poison-pill ceiling of ${maxReclaims} reclaims`
+        )
         await insertHistory(tx, {
           runId: poisoned.run_id,
-          type: 'run.failed',
+          type: 'run.dead_lettered',
           data: { reason: 'step.poisoned', stepId: poisoned.id },
         })
         // Stop other workers from picking up the rest of this now-dead run.
