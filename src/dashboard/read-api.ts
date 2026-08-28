@@ -154,13 +154,21 @@ async function handleGetRunDetail(db: Db, runId: string): Promise<Response> {
     getRunErrors(db, runId),
   ])
 
-  const errors = errorSteps.map((step) => ({
-    stepId: step.id,
-    stepName: step.name,
-    attempt: step.attempt,
-    updatedAt: step.updated_at,
-    error: step.error ? deserializeError(step.error as SerializedError) : null,
-  }))
+  const errors = errorSteps.map((step) => {
+    // deserializeError yields a real `Error` instance so callers get
+    // `instanceof Error` semantics, but Error's message/stack aren't
+    // enumerable own properties — JSON.stringify(new Error(...)) drops them
+    // (see types.ts's codec comment). Project the fields the UI needs into a
+    // plain object explicitly rather than serializing the Error itself.
+    const error = step.error ? deserializeError(step.error as SerializedError) : null
+    return {
+      stepId: step.id,
+      stepName: step.name,
+      attempt: step.attempt,
+      updatedAt: step.updated_at,
+      error: error ? { name: error.name, message: error.message, stack: error.stack } : null,
+    }
+  })
 
   return json({ run, steps, timeline, errors })
 }
