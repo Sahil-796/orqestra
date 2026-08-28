@@ -14,7 +14,7 @@
 
 import type { Db } from '../store/client.ts'
 import { getWorkflowByName, insertWorkflow, type WorkflowRow } from '../store/repositories.ts'
-import type { ConcurrencyLimit, RateLimit, StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
+import type { ConcurrencyLimit, FailurePolicy, RateLimit, StepDefinition, WorkflowDefinition, WorkflowTrigger } from '../types.ts'
 import { validateConcurrency } from '../control/concurrency.ts'
 import { validateRateLimit } from '../control/ratelimit.ts'
 import type { WorkflowContext } from './context.ts'
@@ -122,6 +122,19 @@ export interface WorkflowOptions {
    * workflow when a trigger fires. A workflow may carry several.
    */
   triggers?: WorkflowTrigger[]
+  /**
+   * How this workflow reacts to a step exhausting its retry budget (#28).
+   * Defaults to `'fail_fast'`: the first terminally-failed step rolls back
+   * (runs the saga compensations of every completed step, #29) and the run is
+   * routed to the dead-letter queue (#26). `'continue_on_error'` instead keeps
+   * running steps that don't depend on the failed one and finishes the run as
+   * `'completed_with_errors'` if any step failed — no rollback, no DLQ.
+   *
+   * The executor reads this from the in-process handle (authoritative even
+   * after a crash-recovery resume) and also stamps it onto the run row at
+   * execution start (via `setRunFailurePolicy`) for observability.
+   */
+  failurePolicy?: FailurePolicy
 }
 
 export interface WorkflowHandle {
@@ -129,6 +142,13 @@ export interface WorkflowHandle {
   readonly definition: WorkflowDefinition
   /** Step implementations, keyed by step name — for the Phase 1+ executor. */
   readonly stepFns: Map<string, StepFn>
+  /**
+   * The failure policy this workflow was defined with (#28), resolved to a
+   * concrete value (`'fail_fast'` when the option was omitted). The executor
+   * reads this — not the persisted `run.failure_policy` — as the source of
+   * truth, so a resumed run always uses the code's current policy.
+   */
+  readonly failurePolicy: FailurePolicy
   /** Declarative triggers this workflow was defined with (Phase 5). Empty if none. */
   readonly triggers: readonly WorkflowTrigger[]
   /**
@@ -178,12 +198,14 @@ export function defineWorkflow(
 
   const definition: WorkflowDefinition = { name, version: 1, steps }
   const triggers: readonly WorkflowTrigger[] = options.triggers ?? []
+  const failurePolicy: FailurePolicy = options.failurePolicy ?? 'fail_fast'
 
   const handle: WorkflowHandle = {
     name,
     definition,
     stepFns,
     triggers,
+    failurePolicy,
     async register(sql: Db): Promise<WorkflowRow> {
       const latest = await getWorkflowByName(sql, name)
       if (latest && dagsEqual(latest.dag, definition)) {

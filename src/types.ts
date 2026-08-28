@@ -1,6 +1,27 @@
 // core types shared across the engine + a jsonb-safe Result codec
 
-export type RunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+// Phase 7 adds two terminal values (0008_failure_handling.sql):
+//   'dead_letter' — a run that exhausted its retries (or failed unrecoverably)
+//   and has been parked for inspection / manual retry rather than discarded.
+//   'completed_with_errors' — a run that finished under the `continue_on_error`
+//   failure policy with at least one failed step (partial success).
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'dead_letter'
+  | 'completed_with_errors'
+
+// How a run reacts to a step exhausting its retries (#25), mirrored by the
+// `run.failure_policy` CHECK (0008_failure_handling.sql):
+//   'fail_fast'         — stop the run at the first exhausted step (default).
+//   'continue_on_error' — keep running independent steps, ending in
+//                         `completed_with_errors` if any step failed.
+export type FailurePolicy = 'fail_fast' | 'continue_on_error'
+
+export const FAILURE_POLICIES: readonly FailurePolicy[] = ['fail_fast', 'continue_on_error']
 
 // Phase 4 adds two values (0004_orchestration.sql):
 //   'skipped' — an untaken conditional branch (#17); terminal, not an error.
@@ -22,6 +43,8 @@ export const RUN_STATUSES: readonly RunStatus[] = [
   'completed',
   'failed',
   'cancelled',
+  'dead_letter',
+  'completed_with_errors',
 ]
 
 export const STEP_STATUSES: readonly StepStatus[] = [
@@ -189,4 +212,74 @@ export function decodeResult<T>(raw: unknown): Result<T> {
     return raw as Result<T>
   }
   throw new Error(`decodeResult: value is not a valid Result: ${JSON.stringify(raw)}`)
+}
+
+// ---- observability read model (Phase 8) ------------------------------------
+//
+// These are the shapes the dashboard's read API + UI consume directly, so
+// they live here (shared across units) rather than as private row interfaces
+// in repositories.ts. DB-column-shaped rows (snake_case, matching the table
+// exactly) stay in repositories.ts as usual; these are the camelCase,
+// already-joined/derived views the repository functions return.
+
+/** Mirrors the `worker_health.status` CHECK (0009_observability.sql). */
+export type WorkerHealthStatus = 'running' | 'draining' | 'stopped'
+
+export const WORKER_HEALTH_STATUSES: readonly WorkerHealthStatus[] = [
+  'running',
+  'draining',
+  'stopped',
+]
+
+/** One row of `listRuns` (#30) — a run joined to its workflow name, with a
+ * computed wall-clock duration when the run has both started and finished. */
+export interface RunListItem {
+  id: string
+  workflowId: string
+  workflowName: string
+  namespace: string
+  status: RunStatus
+  priority: number
+  createdAt: Date
+  startedAt: Date | null
+  finishedAt: Date | null
+  /** `finishedAt - startedAt` in milliseconds, or null if either is missing. */
+  durationMs: number | null
+}
+
+/** One row of `listWorkerHealth` (#34) — a worker's last-reported heartbeat
+ * plus the derived `alive` flag (last_heartbeat_at within the staleness
+ * window the caller asked for). */
+export interface WorkerHealthView {
+  workerId: string
+  hostname: string | null
+  status: WorkerHealthStatus
+  leasedSteps: number
+  concurrency: number | null
+  startedAt: Date
+  lastHeartbeatAt: Date
+  /** False when `last_heartbeat_at` is older than the caller's `staleAfterMs`. */
+  alive: boolean
+}
+
+/** One row of `getRunMetrics` (#32) — aggregates over runs/steps matching a
+ * filter, optionally scoped to a single workflow when `groupByWorkflow` is
+ * set. Step duration is approximated as `step.updated_at - step.created_at`
+ * for terminal steps: the schema has no separate "step started running"
+ * timestamp, so this measures the step's whole creation-to-terminal wall
+ * time (queue wait + every attempt + retry backoff), not pure execution
+ * time. `avgRunQueueWaitMs` is the more precise queue-wait figure, computed
+ * from `run.created_at`/`run.started_at`, both of which the schema does
+ * carry. */
+export interface RunMetrics {
+  /** Null when this row aggregates across all workflows (no grouping requested). */
+  workflowName: string | null
+  runCount: number
+  statusCounts: Partial<Record<RunStatus, number>>
+  avgStepDurationMs: number | null
+  p50StepDurationMs: number | null
+  p95StepDurationMs: number | null
+  avgRunQueueWaitMs: number | null
+  totalAttempts: number
+  totalReclaims: number
 }
