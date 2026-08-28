@@ -367,7 +367,13 @@ describe('#11 cancellation', () => {
     const run = await until(
       'the run to be finalized as cancelled',
       () => getRun(sql, runId),
-      (r) => terminal(r)
+      (r) => terminal(r),
+      // Cancellation finalization rides the worker's poll/heartbeat loop, whose
+      // DB round-trips starve under the whole suite's contention on one
+      // Postgres — the default 20s deadline can lapse before this one worker
+      // gets a turn. Widen it (with a matching test timeout below) so a slow
+      // machine reads as slow, not as a failure.
+      55_000
     )
     await stopQuietly(worker)
 
@@ -406,7 +412,7 @@ describe('#11 cancellation', () => {
     expect(types).not.toContain('step.retry_scheduled')
 
     expect(worker.inFlight).toBe(0)
-  }, 40_000)
+  }, 70_000)
 
   test('a step sleeping on a cancelled run is cancelled on wake instead of running', async () => {
     const namespace = `phase3-cancel-sleep-${crypto.randomUUID()}`

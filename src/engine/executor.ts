@@ -237,13 +237,28 @@ export async function executeRun(db: Db, handle: WorkflowHandle, runId: string):
       if (steps.some((s) => s.status === 'blocked')) {
         return { runId, status: 'running' }
       }
-      // #28 continue_on_error: a failed step never becomes `completed`, so its
-      // dependents stay `pending` forever and there is nothing left to run.
-      // That is not a stuck DAG — it is the terminal state of a
-      // partially-successful run. Finish it as `completed_with_errors` (no
-      // rollback, no DLQ), keeping the successful steps' side effects.
-      if (steps.some((s) => s.status === 'failed')) {
-        return finalizeWithErrors(db, runId, steps)
+      // A failed step never becomes `completed`, so its dependents stay
+      // `pending` forever and there is nothing left to run — but what that
+      // terminal state MEANS is policy-dependent, exactly as it is inside the
+      // step loop below.
+      const failed = steps.find((s) => s.status === 'failed')
+      if (failed) {
+        // #28 continue_on_error: this is a partially-successful run. Finish it
+        // as `completed_with_errors` (no rollback, no DLQ), keeping the
+        // successful steps' side effects.
+        if (policy === 'continue_on_error') {
+          return finalizeWithErrors(db, runId, steps)
+        }
+        // fail_fast: a failed step with nothing left to run means the run was
+        // stranded mid-failure — the inline path commits `failStep` and the
+        // dead-letter write in separate transactions, so a crash between them
+        // (recovered here via resumeAll) leaves the run `running` with a
+        // `failed` step. Complete the terminal-failure path now by parking it
+        // in the DLQ, rather than mislabeling it a partial success (which would
+        // hide it from the operator DLQ + manual retry). The worker path has no
+        // such window — its commitOutcome fails-and-dead-letters atomically.
+        const detail = failed.error ? `: ${errorMessage(failed.error as SerializedError)}` : ''
+        return deadLetterAndReturn(db, runId, `step "${failed.name}" failed${detail}`)
       }
       // A well-formed DAG always has something ready or completed; getting
       // here means every remaining step is blocked on a dep that will

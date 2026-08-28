@@ -10,8 +10,15 @@ import { describe, expect, test, beforeAll, afterAll } from 'bun:test'
 import { createDb } from '../src/store/client.ts'
 import { migrate } from '../src/store/migrate.ts'
 import { defineWorkflow } from '../src/define/workflow.ts'
-import { startRun } from '../src/engine/executor.ts'
-import { getRun, getStepsByRun, getRunFailurePolicy } from '../src/store/repositories.ts'
+import { startRun, enqueueRun, resumeRun } from '../src/engine/executor.ts'
+import {
+  getRun,
+  getStepsByRun,
+  getRunFailurePolicy,
+  updateRunStatus,
+  failStep,
+} from '../src/store/repositories.ts'
+import { serializeError } from '../src/types.ts'
 
 const sql = createDb()
 
@@ -110,5 +117,37 @@ describe('failure policies (#28)', () => {
     const result = await startRun(sql, wf)
     expect(result.status).toBe('completed')
     expect(result.output).toEqual({ x: 1, y: 2 })
+  })
+
+  // Regression: the inline driver commits a step's `failStep` and the run's
+  // dead-letter write in SEPARATE transactions, so a crash between them (or any
+  // resumeAll over the resulting state) can re-enter executeRun on a fail_fast
+  // run that is `running` with an already-`failed` step and no runnable work.
+  // That branch must dead-letter — NOT finalize as `completed_with_errors`,
+  // which is a continue_on_error-only terminal state and would hide the run
+  // from the operator DLQ + manual retry.
+  test('fail_fast: a stranded failed step on resume dead-letters, not completed_with_errors', async () => {
+    const wf = defineWorkflow(`policy-strand-${crypto.randomUUID()}`, (builder) => {
+      builder.step('boom', async () => 'never runs on resume')
+      builder.step('after', async () => 'ran', { dependsOn: ['boom'] })
+    })
+    expect(wf.failurePolicy).toBe('fail_fast')
+
+    // Create the run + steps without executing (durable mode), then hand-build
+    // the exact state the crash window leaves behind: run `running`, `boom`
+    // `failed`, `after` still `pending`.
+    const { runId } = await enqueueRun(sql, wf)
+    await updateRunStatus(sql, runId, 'running', { startedAt: new Date() })
+    const steps = await getStepsByRun(sql, runId)
+    const boom = steps.find((s) => s.name === 'boom')!
+    await failStep(sql, boom.id, serializeError(new Error('boom exploded')))
+
+    const result = await resumeRun(sql, wf, runId)
+    expect(result.status).toBe('dead_letter')
+
+    const run = await getRun(sql, runId)
+    expect(run?.status).toBe('dead_letter')
+    expect(run?.dead_letter_reason).toContain('boom')
+    expect(run?.dead_lettered_at).not.toBeNull()
   })
 })
