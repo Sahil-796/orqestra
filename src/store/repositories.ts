@@ -5,7 +5,18 @@
 import type postgres from 'postgres'
 import type { Db } from './client.ts'
 import { withTransaction } from './client.ts'
-import type { FailurePolicy, RunStatus, ScheduleKind, SerializedError, StepStatus, WorkflowDefinition } from '../types.ts'
+import type {
+  FailurePolicy,
+  RunMetrics,
+  RunListItem,
+  RunStatus,
+  ScheduleKind,
+  SerializedError,
+  StepStatus,
+  WorkerHealthStatus,
+  WorkerHealthView,
+  WorkflowDefinition,
+} from '../types.ts'
 import { encodeResult, ok, type Result } from '../types.ts'
 
 function toJson(value: unknown): postgres.JSONValue {
@@ -1916,4 +1927,382 @@ export async function hasCompensationRun(
     ) as ran
   `
   return rows[0]?.ran ?? false
+}
+
+// ---- observability read model (Phase 8) -----------------------------------
+//
+// Pure reads behind the storage boundary — this is the whole reason this
+// unit exists. The dashboard's collectors, read API, and UI all build on the
+// functions below rather than embedding SQL of their own. Nothing here
+// mutates run/step state (except `upsertWorkerHeartbeat`, which only ever
+// touches the new `worker_health` table).
+
+// ---- #30: run listing + per-run timeline -----------------------------------
+
+export interface RunListFilter {
+  status?: RunStatus
+  workflowName?: string
+  namespace?: string
+  /** Default 50. */
+  limit?: number
+  /** Default 0. */
+  offset?: number
+}
+
+// Paginated, newest-first run listing joined to the workflow name (the raw
+// `run` row only carries `workflow_id`), with a computed `durationMs` so
+// callers don't have to do date maths themselves. Backed by
+// `run_status_created_at_idx` / `run_namespace_created_at_idx`
+// (0009_observability.sql).
+export async function listRuns(sql: Db, filter: RunListFilter = {}): Promise<RunListItem[]> {
+  const limit = filter.limit ?? 50
+  const offset = filter.offset ?? 0
+  const statusFilter = filter.status ? sql`and r.status = ${filter.status}` : sql``
+  const workflowFilter = filter.workflowName ? sql`and w.name = ${filter.workflowName}` : sql``
+  const namespaceFilter = filter.namespace ? sql`and r.namespace = ${filter.namespace}` : sql``
+
+  const rows = await sql<
+    {
+      id: string
+      workflow_id: string
+      workflow_name: string
+      namespace: string
+      status: RunStatus
+      priority: number
+      created_at: Date
+      started_at: Date | null
+      finished_at: Date | null
+    }[]
+  >`
+    select
+      r.id, r.workflow_id, w.name as workflow_name, r.namespace, r.status, r.priority,
+      r.created_at, r.started_at, r.finished_at
+    from run r
+    join workflow w on w.id = r.workflow_id
+    where true
+      ${statusFilter}
+      ${workflowFilter}
+      ${namespaceFilter}
+    order by r.created_at desc
+    limit ${limit} offset ${offset}
+  `
+
+  return rows.map((row) => ({
+    id: row.id,
+    workflowId: row.workflow_id,
+    workflowName: row.workflow_name,
+    namespace: row.namespace,
+    status: row.status,
+    priority: row.priority,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    durationMs:
+      row.started_at && row.finished_at
+        ? row.finished_at.getTime() - row.started_at.getTime()
+        : null,
+  }))
+}
+
+// The per-run timeline (#30): every `history` row for a run, in the order it
+// happened. `history_run_id_idx` (0001) already covers (run_id, at).
+export async function getRunTimeline(sql: Db, runId: string): Promise<HistoryRow[]> {
+  return sql<HistoryRow[]>`
+    select * from history where run_id = ${runId} order by at, id
+  `
+}
+
+// ---- #31: structured logs (storage side) -----------------------------------
+//
+// No new table: collectors (a later unit) write structured logs as ordinary
+// `history` rows via `insertHistory(sql, { runId, type: 'log', data })` — this
+// is just the read-side filter, backed by `history_run_id_type_at_idx`
+// (0009_observability.sql).
+export async function getRunLogs(sql: Db, runId: string): Promise<HistoryRow[]> {
+  return sql<HistoryRow[]>`
+    select * from history where run_id = ${runId} and type = 'log' order by at, id
+  `
+}
+
+// ---- #32: duration metrics --------------------------------------------------
+
+export interface RunMetricsFilter {
+  workflowName?: string
+  namespace?: string
+  /** Only consider runs created within the last `sinceMs` milliseconds. */
+  sinceMs?: number
+  /** When true, return one row per workflow instead of one aggregate row. */
+  groupByWorkflow?: boolean
+}
+
+// Aggregates over runs/steps matching `filter`. Always returns an array:
+// one row (workflowName: null) when `groupByWorkflow` is unset, one row per
+// workflow name otherwise. See RunMetrics's doc comment (types.ts) for why
+// step duration is a creation-to-terminal proxy rather than pure execution
+// time, and why `avgRunQueueWaitMs` (from `run.created_at`/`started_at`) is
+// the more precise queue-wait figure.
+//
+// `percentile_cont` computes p50/p95 directly in Postgres so the whole step
+// table for a window never has to cross the wire for the caller to sort it.
+// Backed by `step_status_idx` (0009_observability.sql) for the terminal-step
+// scan.
+export async function getRunMetrics(
+  sql: Db,
+  filter: RunMetricsFilter = {}
+): Promise<RunMetrics[]> {
+  const workflowFilter = filter.workflowName ? sql`and w.name = ${filter.workflowName}` : sql``
+  const namespaceFilter = filter.namespace ? sql`and r.namespace = ${filter.namespace}` : sql``
+  const sinceFilter =
+    filter.sinceMs !== undefined
+      ? sql`and r.created_at >= now() - (${filter.sinceMs} * interval '1 millisecond')`
+      : sql``
+  const groupCol = filter.groupByWorkflow ? sql`w.name` : sql`null::text`
+
+  const statusRows = await sql<{ workflow_name: string | null; status: RunStatus; count: string }[]>`
+    select ${groupCol} as workflow_name, r.status, count(*)::text as count
+    from run r
+    join workflow w on w.id = r.workflow_id
+    where true ${workflowFilter} ${namespaceFilter} ${sinceFilter}
+    group by ${groupCol}, r.status
+  `
+
+  const queueWaitRows = await sql<{ workflow_name: string | null; avg_wait_ms: string | null }[]>`
+    select ${groupCol} as workflow_name,
+      avg(extract(epoch from (r.started_at - r.created_at)) * 1000) as avg_wait_ms
+    from run r
+    join workflow w on w.id = r.workflow_id
+    where r.started_at is not null
+      ${workflowFilter} ${namespaceFilter} ${sinceFilter}
+    group by ${groupCol}
+  `
+
+  const stepRows = await sql<
+    {
+      workflow_name: string | null
+      avg_ms: string | null
+      p50_ms: string | null
+      p95_ms: string | null
+      total_attempts: string | null
+      total_reclaims: string | null
+    }[]
+  >`
+    select ${groupCol} as workflow_name,
+      avg(extract(epoch from (s.updated_at - s.created_at)) * 1000) as avg_ms,
+      percentile_cont(0.5) within group (
+        order by extract(epoch from (s.updated_at - s.created_at)) * 1000
+      ) as p50_ms,
+      percentile_cont(0.95) within group (
+        order by extract(epoch from (s.updated_at - s.created_at)) * 1000
+      ) as p95_ms,
+      sum(s.attempt)::text as total_attempts,
+      sum(s.reclaim_count)::text as total_reclaims
+    from step s
+    join run r on r.id = s.run_id
+    join workflow w on w.id = r.workflow_id
+    where s.status in ('completed', 'failed')
+      ${workflowFilter} ${namespaceFilter} ${sinceFilter}
+    group by ${groupCol}
+  `
+
+  const byWorkflow = new Map<string | null, RunMetrics>()
+  function acc(workflowName: string | null): RunMetrics {
+    let existing = byWorkflow.get(workflowName)
+    if (!existing) {
+      existing = {
+        workflowName,
+        runCount: 0,
+        statusCounts: {},
+        avgStepDurationMs: null,
+        p50StepDurationMs: null,
+        p95StepDurationMs: null,
+        avgRunQueueWaitMs: null,
+        totalAttempts: 0,
+        totalReclaims: 0,
+      }
+      byWorkflow.set(workflowName, existing)
+    }
+    return existing
+  }
+
+  for (const row of statusRows) {
+    const entry = acc(row.workflow_name)
+    const count = Number(row.count)
+    entry.statusCounts[row.status] = count
+    entry.runCount += count
+  }
+  for (const row of queueWaitRows) {
+    acc(row.workflow_name).avgRunQueueWaitMs = row.avg_wait_ms !== null ? Number(row.avg_wait_ms) : null
+  }
+  for (const row of stepRows) {
+    const entry = acc(row.workflow_name)
+    entry.avgStepDurationMs = row.avg_ms !== null ? Number(row.avg_ms) : null
+    entry.p50StepDurationMs = row.p50_ms !== null ? Number(row.p50_ms) : null
+    entry.p95StepDurationMs = row.p95_ms !== null ? Number(row.p95_ms) : null
+    entry.totalAttempts = row.total_attempts !== null ? Number(row.total_attempts) : 0
+    entry.totalReclaims = row.total_reclaims !== null ? Number(row.total_reclaims) : 0
+  }
+
+  // Ensure the ungrouped case always returns exactly one row, even when
+  // nothing in `filter` matched anything yet (an empty dashboard should see
+  // a zeroed-out metrics row, not an empty array).
+  if (byWorkflow.size === 0 && !filter.groupByWorkflow) acc(null)
+
+  return [...byWorkflow.values()]
+}
+
+// ---- #33: error details + traces -------------------------------------------
+
+// Every failed step for a run, most-recently-failed first, with its full
+// `error` jsonb intact — the caller runs `deserializeError` on `.error` to
+// get back a real `Error` (message/stack/cause) for display. Backed by the
+// partial `step_run_id_failed_idx` (0009_observability.sql).
+export async function getRunErrors(sql: Db, runId: string): Promise<StepRow[]> {
+  return sql<StepRow[]>`
+    select * from step
+    where run_id = ${runId} and status = 'failed'
+    order by updated_at desc
+  `
+}
+
+// ---- #34: worker health -----------------------------------------------------
+
+export interface WorkerHealthRow {
+  worker_id: string
+  hostname: string | null
+  status: WorkerHealthStatus
+  leased_steps: number
+  concurrency: number | null
+  started_at: Date
+  last_heartbeat_at: Date
+}
+
+export interface UpsertWorkerHeartbeatInput {
+  workerId: string
+  hostname?: string
+  status?: WorkerHealthStatus
+  leasedSteps?: number
+  concurrency?: number
+}
+
+// The collector's write side: a worker calls this on every heartbeat tick.
+// `on conflict (worker_id) do update` makes this the same row for the life of
+// a worker process — `started_at` is set once, at first insert, and never
+// moved by later heartbeats (it is deliberately absent from the DO UPDATE
+// SET list).
+export async function upsertWorkerHeartbeat(
+  sql: Db,
+  input: UpsertWorkerHeartbeatInput
+): Promise<WorkerHealthRow> {
+  const rows = await sql<WorkerHealthRow[]>`
+    insert into worker_health (worker_id, hostname, status, leased_steps, concurrency, last_heartbeat_at)
+    values (
+      ${input.workerId},
+      ${input.hostname ?? null},
+      ${input.status ?? 'running'},
+      ${input.leasedSteps ?? 0},
+      ${input.concurrency ?? null},
+      now()
+    )
+    on conflict (worker_id) do update set
+      hostname = excluded.hostname,
+      status = excluded.status,
+      leased_steps = excluded.leased_steps,
+      concurrency = excluded.concurrency,
+      last_heartbeat_at = now()
+    returning *
+  `
+  const row = rows[0]
+  if (!row) throw new Error('upsertWorkerHeartbeat: insert returned no row')
+  return row
+}
+
+// Every known worker, freshest heartbeat first, with a derived `alive` flag:
+// true iff `last_heartbeat_at` is within `staleAfterMs` of now. Default
+// 30s mirrors a small multiple of a typical poll interval — callers with a
+// different `ORQ_POLL_INTERVAL_MS` should pass their own threshold. Backed
+// by `worker_health_last_heartbeat_idx` (0009_observability.sql).
+export async function listWorkerHealth(
+  sql: Db,
+  staleAfterMs = 30_000
+): Promise<WorkerHealthView[]> {
+  const rows = await sql<(WorkerHealthRow & { alive: boolean })[]>`
+    select *,
+      last_heartbeat_at >= now() - (${staleAfterMs} * interval '1 millisecond') as alive
+    from worker_health
+    order by last_heartbeat_at desc
+  `
+  return rows.map((row) => ({
+    workerId: row.worker_id,
+    hostname: row.hostname,
+    status: row.status,
+    leasedSteps: row.leased_steps,
+    concurrency: row.concurrency,
+    startedAt: row.started_at,
+    lastHeartbeatAt: row.last_heartbeat_at,
+    alive: row.alive,
+  }))
+}
+
+// ---- #35: queue depth / throughput -----------------------------------------
+
+// Full-table step-status counts — `countStepsByStatus` scoped to one run,
+// this is the fleet-wide equivalent the dashboard's queue-depth widget wants.
+// Backed by `step_status_idx` (0009_observability.sql).
+export async function getQueueDepth(sql: Db): Promise<Record<StepStatus, number>> {
+  const rows = await sql<{ status: StepStatus; count: string }[]>`
+    select status, count(*)::text as count from step group by status
+  `
+  const counts = {} as Record<StepStatus, number>
+  for (const row of rows) counts[row.status] = Number(row.count)
+  return counts
+}
+
+export interface ThroughputBucket {
+  bucketStart: Date
+  completed: number
+  failed: number
+}
+
+// Completed/failed run counts over the last `sinceMs`, bucketed into
+// `bucketMs`-wide windows anchored to the epoch (so buckets line up across
+// calls). Runs, not steps: `step` has no `finished_at` column (only
+// `created_at`/`updated_at`), so throughput is measured off `run.finished_at`
+// — backed by the partial `run_finished_at_idx` (0009_observability.sql).
+// `completed_with_errors` counts as completed (the run did finish); `failed`
+// and `dead_letter` both count as failed (neither is a clean success).
+// Buckets with zero activity are omitted rather than zero-filled — callers
+// building a chart should fill gaps themselves against their own axis.
+export async function getThroughput(
+  sql: Db,
+  sinceMs: number,
+  bucketMs = 60_000
+): Promise<ThroughputBucket[]> {
+  const rows = await sql<{ bucket_start: Date; status: RunStatus; count: string }[]>`
+    select
+      to_timestamp(
+        floor(extract(epoch from finished_at) * 1000 / ${bucketMs}) * ${bucketMs} / 1000.0
+      ) as bucket_start,
+      status,
+      count(*)::text as count
+    from run
+    where finished_at is not null
+      and finished_at >= now() - (${sinceMs} * interval '1 millisecond')
+    group by bucket_start, status
+    order by bucket_start
+  `
+
+  const byBucket = new Map<number, ThroughputBucket>()
+  for (const row of rows) {
+    const key = row.bucket_start.getTime()
+    let bucket = byBucket.get(key)
+    if (!bucket) {
+      bucket = { bucketStart: row.bucket_start, completed: 0, failed: 0 }
+      byBucket.set(key, bucket)
+    }
+    const count = Number(row.count)
+    if (row.status === 'completed' || row.status === 'completed_with_errors') bucket.completed += count
+    else if (row.status === 'failed' || row.status === 'dead_letter') bucket.failed += count
+  }
+
+  return [...byBucket.values()].sort((a, b) => a.bucketStart.getTime() - b.bucketStart.getTime())
 }
