@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>orqestra dashboard</title>
+  <link rel="stylesheet" href="/dashboard/ui/styles.css" />
+</head>
+<body>
+  <!-- ORQESTRA_DASHBOARD_ROOT: marker for the serving test -->
+  <header class="topbar">
+    <div class="brand">orqestra <span class="dim">/ dashboard</span></div>
+    <nav class="tabs" id="tabs">
+      <button data-view="runs" class="tab-btn active">Runs</button>
+      <button data-view="metrics" class="tab-btn">Metrics</button>
+      <button data-view="queue" class="tab-btn">Queue</button>
+      <button data-view="workers" class="tab-btn">Workers</button>
+    </nav>
+    <div class="status" id="conn-status" title="API connectivity"></div>
+  </header>
+
+  <main id="app">
+    <section id="view-runs" class="view active">
+      <div class="panel-header">
+        <h2>Runs</h2>
+        <div class="filters">
+          <label>
+            Status
+            <select id="filter-status">
+              <option value="">any</option>
+              <option value="queued">queued</option>
+              <option value="running">running</option>
+              <option value="completed">completed</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+              <option value="dead_letter">dead_letter</option>
+              <option value="completed_with_errors">completed_with_errors</option>
+            </select>
+          </label>
+          <label>
+            Workflow
+            <input id="filter-workflow" type="text" placeholder="workflow name" />
+          </label>
+          <label>
+            Namespace
+            <input id="filter-namespace" type="text" placeholder="namespace" />
+          </label>
+          <button id="filter-apply">Apply</button>
+          <button id="filter-clear" class="ghost">Clear</button>
+        </div>
+      </div>
+      <div id="runs-table-wrap"><p class="empty">Loading...</p></div>
+      <div class="pager">
+        <button id="page-prev" class="ghost">&larr; prev</button>
+        <span id="page-info" class="dim"></span>
+        <button id="page-next" class="ghost">next &rarr;</button>
+      </div>
+    </section>
+
+    <section id="view-run-detail" class="view">
+      <button id="back-to-runs" class="ghost">&larr; back to runs</button>
+      <div id="run-detail-content"><p class="empty">Loading...</p></div>
+    </section>
+
+    <section id="view-metrics" class="view">
+      <div class="panel-header">
+        <h2>Metrics</h2>
+        <div class="filters">
+          <label>
+            <input id="metrics-group" type="checkbox" /> group by workflow
+          </label>
+          <button id="metrics-refresh">Refresh</button>
+        </div>
+      </div>
+      <div id="metrics-content"><p class="empty">Loading...</p></div>
+    </section>
+
+    <section id="view-queue" class="view">
+      <div class="panel-header">
+        <h2>Queue &amp; throughput</h2>
+        <button id="queue-refresh">Refresh</button>
+      </div>
+      <div id="queue-content"><p class="empty">Loading...</p></div>
+    </section>
+
+    <section id="view-workers" class="view">
+      <div class="panel-header">
+        <h2>Workers</h2>
+        <span class="dim">auto-refreshing every 5s</span>
+      </div>
+      <div id="workers-content"><p class="empty">Loading...</p></div>
+    </section>
+  </main>
+
+  <script type="module" src="/dashboard/ui/app.js"></script>
+</body>
+</html>
