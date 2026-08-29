@@ -100,6 +100,10 @@ export interface Worker {
   stop(): Promise<void>
   /** How many steps this worker is currently running. */
   readonly inFlight: number
+  /** Number of claim queries issued so far (bench-only counter; zero behavior change). */
+  readonly claimAttempts: number
+  /** Number of claim queries that actually returned a step to run (bench-only counter). */
+  readonly claimsFound: number
 }
 
 function defaultWorkerId(): string {
@@ -186,6 +190,10 @@ export function createWorker(options: WorkerOptions): Worker {
   let stopping = false
   let loopDone: Promise<void> | undefined
   const inFlight = new Set<Promise<void>>()
+  // Bench-only counters (#claimAttempts/#claimsFound on the returned Worker):
+  // additive, no effect on control flow, timing, or the claim SQL itself.
+  let claimAttempts = 0
+  let claimsFound = 0
 
   async function resolveRunAndHandle(
     runId: string,
@@ -1015,8 +1023,10 @@ export function createWorker(options: WorkerOptions): Worker {
       let claimedAny = false
 
       while (!stopping && inFlight.size < concurrency) {
+        claimAttempts++
         const step = await claimStep(db, { workerId, leaseTtlMs, namespace })
         if (!step) break
+        claimsFound++
         claimedAny = true
 
         const promise = (async () => {
@@ -1061,6 +1071,14 @@ export function createWorker(options: WorkerOptions): Worker {
 
     get inFlight(): number {
       return inFlight.size
+    },
+
+    get claimAttempts(): number {
+      return claimAttempts
+    },
+
+    get claimsFound(): number {
+      return claimsFound
     },
   }
 }
