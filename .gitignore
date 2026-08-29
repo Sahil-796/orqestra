@@ -39,3 +39,7 @@ idea.md
 # scribe
 .scribe/
 docs/scribe/
+
+# bench output (keep the placeholder so the dir exists in git)
+bench/results/*
+!bench/results/.gitkeep
