@@ -50,6 +50,36 @@ on behavior.
 - **event-wake** — steps that block on an event and are woken by a publish,
   exercising the event-wait suspend/resume path.
 
+## Two measurement modes
+
+By default a scenario is a **cold burst**: enqueue the whole backlog, *then*
+start the workers, and time the drain to empty. That is simple and good for
+correctness/relative comparison, but it folds worker boot-up and the idle
+drain tail into every latency number — which is why an empty job can look like
+it took a second.
+
+`--steady` measures the way a real service actually runs. The worker pool is
+started **first** and allowed to warm, then a large backlog is fed so the queue
+stays saturated, and only the **steady middle** of the drain is measured (the
+warm-up ramp and the idle drain tail are trimmed — see `--warmup-frac` /
+`--drain-frac`). It reports throughput over the steady window and, crucially,
+splits per-run time into:
+
+- **engine processing** (`finished − started`) — the real cost of running the
+  job: step body + commit/advance. This is the small, honest number (single-
+  digit ms for a trivial step).
+- **queue wait** (`started − created`) — time the job sat in line before a
+  worker picked it up. Under a deliberately over-full backlog this is large by
+  design; it reflects load shape, not engine speed.
+
+```bash
+bun run bench contention --steady --runs=1500 --workers=4 --concurrency=8
+bun run bench contention --steady --sweep=workers=1,2,4,8   # scaling curve
+```
+
+Steady mode also uses product-appropriate defaults (large backlog, higher
+concurrency, tight poll interval); any explicit flag still overrides them.
+
 ## Metrics vocabulary
 
 - **Throughput**: `runsPerSec` and `stepsPerSec` — wall-clock runs/steps

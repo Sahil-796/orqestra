@@ -13,7 +13,13 @@ import { createDb } from '../src/store/client.ts'
 import { migrate } from '../src/store/migrate.ts'
 import { formatReport } from './metrics.ts'
 import { scenarios, type Scenario, type ScenarioKnobs } from './scenarios.ts'
-import { runScenario, type BenchResult } from './harness.ts'
+import {
+  runScenario,
+  runScenarioSteady,
+  type BenchResult,
+  type SteadyResult,
+  type SteadyOptions,
+} from './harness.ts'
 
 const NUMERIC_FLAGS: Record<string, keyof ScenarioKnobs> = {
   '--runs': 'runs',
@@ -31,11 +37,30 @@ const DEFAULT_RUNS = 50
 const DEFAULT_WORKERS = 4
 const DEFAULT_CONCURRENCY = 4
 
+// Product-shaped defaults for --steady: a warm pool draining a large, always-
+// full backlog with a tight poll interval (a latency-sensitive server tunes
+// polling down). These override a scenario's small smoke defaults for the load
+// knobs, but any explicit CLI flag still wins.
+const STEADY_BASE: Partial<ScenarioKnobs> = {
+  runs: 1000,
+  workers: 4,
+  concurrency: 8,
+  pollIntervalMs: 5,
+}
+
+const FLOAT_OPTS: Record<string, keyof SteadyOptions> = {
+  '--warmup-frac': 'warmupFrac',
+  '--drain-frac': 'drainFrac',
+  '--settle-ms': 'settleMs',
+}
+
 interface ParsedArgs {
   scenarioName: string | undefined
   flagKnobs: Partial<ScenarioKnobs>
   sweep: { knob: keyof ScenarioKnobs; values: number[] } | undefined
   json: boolean
+  steady: boolean
+  steadyOpts: SteadyOptions
 }
 
 function usageAndExit(): never {
@@ -44,6 +69,9 @@ function usageAndExit(): never {
   console.error(`Available scenarios: ${names.join(', ')}`)
   console.error(
     'Flags: --runs --workers --concurrency --steps --width --fail --step-work-ms --lease-ttl --poll-interval (numbers), --sweep=<knob>=v1,v2,..., --json'
+  )
+  console.error(
+    'Steady-state (product-shaped): --steady [--warmup-frac 0.2 --drain-frac 0.1 --settle-ms 150]'
   )
   process.exit(1)
 }
@@ -54,10 +82,29 @@ function parseArgs(argv: string[]): ParsedArgs {
   const flagKnobs: Partial<ScenarioKnobs> = {}
   let sweep: ParsedArgs['sweep']
   let json = false
+  let steady = false
+  const steadyOpts: SteadyOptions = {}
 
   for (const arg of rest) {
     if (arg === '--json') {
       json = true
+      continue
+    }
+    if (arg === '--steady') {
+      steady = true
+      continue
+    }
+    const floatName = arg.indexOf('=') === -1 ? arg : arg.slice(0, arg.indexOf('='))
+    const floatKey = FLOAT_OPTS[floatName]
+    if (floatKey) {
+      const eq = arg.indexOf('=')
+      const raw = eq !== -1 ? arg.slice(eq + 1) : rest[rest.indexOf(arg) + 1]
+      const value = Number(raw)
+      if (raw === undefined || !Number.isFinite(value)) {
+        console.error(`flag "${floatName}" needs a numeric value`)
+        process.exit(1)
+      }
+      steadyOpts[floatKey] = value
       continue
     }
     if (arg.startsWith('--sweep=')) {
@@ -115,11 +162,20 @@ function parseArgs(argv: string[]): ParsedArgs {
     flagKnobs[knobKey] = value
   }
 
-  return { scenarioName, flagKnobs, sweep, json }
+  return { scenarioName, flagKnobs, sweep, json, steady, steadyOpts }
 }
 
-function mergeKnobs(scenario: Scenario, flagKnobs: Partial<ScenarioKnobs>): ScenarioKnobs {
-  const merged: Partial<ScenarioKnobs> = { ...scenario.defaultKnobs, ...flagKnobs }
+function mergeKnobs(
+  scenario: Scenario,
+  flagKnobs: Partial<ScenarioKnobs>,
+  steady = false
+): ScenarioKnobs {
+  // Steady load knobs sit ABOVE scenario smoke defaults but BELOW explicit
+  // CLI flags, so `--steady` gets a big warm backlog by default yet stays
+  // fully overridable.
+  const merged: Partial<ScenarioKnobs> = steady
+    ? { ...scenario.defaultKnobs, ...STEADY_BASE, ...flagKnobs }
+    : { ...scenario.defaultKnobs, ...flagKnobs }
   return {
     runs: merged.runs ?? DEFAULT_RUNS,
     workers: merged.workers ?? DEFAULT_WORKERS,
@@ -159,7 +215,34 @@ function printResult(scenarioName: string, knobs: ScenarioKnobs, result: BenchRe
   )
 }
 
-async function writeJsonResults(scenarioName: string, results: BenchResult[]): Promise<void> {
+function fmt(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(2)
+}
+
+function printSteady(scenarioName: string, knobs: ScenarioKnobs, r: SteadyResult): void {
+  const lines: string[] = []
+  lines.push(`scenario: ${scenarioName} (steady-state)`)
+  lines.push(`  workers          ${knobs.workers} x concurrency ${knobs.concurrency}`)
+  lines.push(`  backlog          ${r.totalRuns} runs, measured ${r.keptRuns} in steady window`)
+  lines.push(`  window           ${fmt(r.steadyWindowMs)} ms`)
+  lines.push('  throughput:')
+  lines.push(`    runs/sec       ${fmt(r.steadyRunsPerSec)}`)
+  lines.push(`    steps/sec      ${fmt(r.steadyStepsPerSec)}`)
+  lines.push('  engine processing (finished - started), ms:')
+  lines.push(`    p50 ${fmt(r.processTime.p50)}   p95 ${fmt(r.processTime.p95)}   p99 ${fmt(r.processTime.p99)}   max ${fmt(r.processTime.max)}`)
+  lines.push('  queue wait (started - created), ms:')
+  lines.push(`    p50 ${fmt(r.queueWait.p50)}   p95 ${fmt(r.queueWait.p95)}   p99 ${fmt(r.queueWait.p99)}   max ${fmt(r.queueWait.max)}`)
+  lines.push('  end-to-end (finished - created), ms:')
+  lines.push(`    p50 ${fmt(r.endToEnd.p50)}   p95 ${fmt(r.endToEnd.p95)}   p99 ${fmt(r.endToEnd.p99)}   max ${fmt(r.endToEnd.max)}`)
+  lines.push('  guardrails:')
+  lines.push(`    emptyPollRatio ${r.emptyPollRatio.toFixed(3)}   allTerminal ${r.allTerminal}   unexpectedFailures ${r.unexpectedFailures}`)
+  console.log(lines.join('\n'))
+}
+
+async function writeJsonResults(
+  scenarioName: string,
+  results: (BenchResult | SteadyResult)[]
+): Promise<void> {
   const here = dirname(fileURLToPath(import.meta.url))
   const dir = join(here, 'results')
   await mkdir(dir, { recursive: true })
@@ -187,9 +270,35 @@ async function main(): Promise<void> {
 
   let anyNotTerminal = false
   let anyUnexpectedFailures = 0
-  const allResults: BenchResult[] = []
+  const allResults: (BenchResult | SteadyResult)[] = []
 
-  if (args.sweep) {
+  if (args.steady) {
+    const values = args.sweep ? args.sweep.values : [undefined]
+    const sweepKnob = args.sweep?.knob
+    const baseline: { value: number; result: SteadyResult }[] = []
+    for (const value of values) {
+      const flags =
+        sweepKnob && value !== undefined ? { ...args.flagKnobs, [sweepKnob]: value } : args.flagKnobs
+      const knobs = mergeKnobs(scenario, flags, true)
+      const result = await runScenarioSteady(scenario, knobs, args.steadyOpts)
+      allResults.push(result)
+      printSteady(scenario.name, knobs, result)
+      if (!result.allTerminal) anyNotTerminal = true
+      anyUnexpectedFailures += result.unexpectedFailures
+      if (sweepKnob && value !== undefined) baseline.push({ value, result })
+    }
+    const firstS = baseline[0]
+    if (sweepKnob && firstS && firstS.result.steadyStepsPerSec > 0) {
+      console.log('')
+      console.log(`scaling summary (vs ${sweepKnob}=${firstS.value}):`)
+      for (const { value, result } of baseline) {
+        const ratio = result.steadyStepsPerSec / firstS.result.steadyStepsPerSec
+        console.log(
+          `  ${sweepKnob}=${value}: ${result.steadyStepsPerSec.toFixed(2)} steps/s (${ratio.toFixed(2)}x)`
+        )
+      }
+    }
+  } else if (args.sweep) {
     const { knob, values } = args.sweep
     const baseline: { workers: number; result: BenchResult }[] = []
     for (const value of values) {
